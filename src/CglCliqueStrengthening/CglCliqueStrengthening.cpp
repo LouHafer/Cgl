@@ -94,13 +94,17 @@ size_t CliqueRows::rows() const {
   return nRows_;
 }
 
-CglCliqueStrengthening::CglCliqueStrengthening(OsiSolverInterface *model) :
+CglCliqueStrengthening::CglCliqueStrengthening(OsiSolverInterface *model, CoinMessageHandler *dhandler) :
 nExtended_(0), nDominated_(0), handler_(NULL), defaultHandler_(true) {
-  handler_ = new CoinMessageHandler();
-  handler_->setLogLevel(2);
+
+  if (dhandler)
+    this->passInMessageHandler(dhandler);
+  else
+    handler_ = new CoinMessageHandler();
+
   messages_ = CglMessage();
   model_ = model;
-  model_->checkCGraph();
+  model_->checkCGraph(dhandler);
   cgraph_ = model_->getCGraph();
   cliqueRows_ = NULL;
   posInClqRows_ = NULL;
@@ -247,7 +251,8 @@ void CglCliqueStrengthening::strengthenCliques(size_t extMethod) {
   nExtended_ = nDominated_ = 0;
 
   if (model_->getNumCols() == 0 || model_->getNumRows() == 0 || cliqueRows_->rows() == 0) {
-    handler_->message(CGL_PROCESS_CLQSTR, messages_) << nExtended_ << nDominated_ << CoinMessageEol;
+    if (handler_->logLevel())
+        handler_->message(CGL_PROCESS_CLQSTR, messages_) << nExtended_ << nDominated_ << CoinMessageEol;
     return;
   }
 
@@ -262,7 +267,8 @@ void CglCliqueStrengthening::strengthenCliques(size_t extMethod) {
     addStrongerCliques(newCliques);
   }
 
-  handler_->message(CGL_PROCESS_CLQSTR, messages_) << nExtended_ << nDominated_ << CoinMessageEol;
+  if (handler_->logLevel())
+      handler_->message(CGL_PROCESS_CLQSTR, messages_) << nExtended_ << nDominated_ << CoinMessageEol;
   delete newCliques;
 }
 
@@ -359,7 +365,6 @@ void CglCliqueStrengthening::cliqueExtension(size_t extMethod, CoinCliqueSet *ne
   // if reduced costs are not available, change the
   // extension method
   if (rc == NULL) {
-    handler_->message(CGL_WARNING_CLQSTR, messages_) << CoinMessageEol;
     extMethod = 2;
   }
 
