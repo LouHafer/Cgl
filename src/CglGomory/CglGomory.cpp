@@ -1500,11 +1500,12 @@ CglGomory::generateCuts(
 		}
 	      }
 	    }
-	    if (largest>1.0e10*smallest||(number>20&&smallest<number*1.0e-6)||
-		numberNonInteger<-10||!number) {
+	    if (largest>1.0e8*smallest||(number>20&&smallest<number*1.0e-6)||
+		numberNonInteger<-10 || !number) {
 	      //assert (number); // debug this - looks as if it could be
 	      number=limit+1; //reject
 	      numberNonInteger=1;
+#if 0
 	    } else if (largest>1.0e9*smallest) {
 #ifdef CLP_INVESTIGATE2
 	      printf("WOuld reject %g %g ratio %g\n",smallest,largest,
@@ -1512,6 +1513,7 @@ CglGomory::generateCuts(
 #endif
 #if MORE_GOMORY_CUTS==1||MORE_GOMORY_CUTS==3
 	      accurate=false;
+#endif
 #endif
 	    } else {
 #define PRINT_NUMBER 0
@@ -1596,7 +1598,7 @@ CglGomory::generateCuts(
 	    if (number>50&&numberNonInteger)
 	      bounds[1] = rhs+tolerance6+1.0e-8*fabs(rhs); // weaken
 #if GOMORY_RELAX_NUMBER
-	    else if (number>GOMORY_RELAX_NUMBER&&numberNonInteger>1)
+	    else if (number>GOMORY_RELAX_NUMBER&&numberNonInteger>1) 
 	      bounds[1] = rhs+tolerance6+1.0e-8*fabs(rhs); // weaken
 #endif
 	    // if close to integer - round up
@@ -1917,7 +1919,6 @@ away_(0.05),
 awayAtRoot_(0.05),
 conditionNumberMultiplier_(1.0e-18),
 largestFactorMultiplier_(1.0e-13),
-originalSolver_(NULL),
 limit_(50),
 limitAtRoot_(0),
 dynamicLimitInTree_(-1),
@@ -1937,7 +1938,6 @@ CglGomory::CglGomory (const CglGomory & source) :
   awayAtRoot_(source.awayAtRoot_),
   conditionNumberMultiplier_(source.conditionNumberMultiplier_),
   largestFactorMultiplier_(source.largestFactorMultiplier_),
-  originalSolver_(NULL),
   limit_(source.limit_),
   limitAtRoot_(source.limitAtRoot_),
   dynamicLimitInTree_(source.dynamicLimitInTree_),
@@ -1945,8 +1945,6 @@ CglGomory::CglGomory (const CglGomory & source) :
   alternateFactorization_(source.alternateFactorization_),
   gomoryType_(source.gomoryType_)
 { 
-  if (source.originalSolver_)
-    originalSolver_ = source.originalSolver_->clone();
 }
 
 //-------------------------------------------------------------------
@@ -1963,7 +1961,6 @@ CglGomory::clone() const
 //-------------------------------------------------------------------
 CglGomory::~CglGomory ()
 {
-  delete originalSolver_;
 }
 
 //----------------------------------------------------------------
@@ -1984,11 +1981,6 @@ CglGomory::operator=(const CglGomory& rhs)
     numberTimesStalled_ = rhs.numberTimesStalled_;
     alternateFactorization_=rhs.alternateFactorization_; 
     gomoryType_ = rhs.gomoryType_;
-    delete originalSolver_;
-    if (rhs.originalSolver_)
-      originalSolver_ = rhs.originalSolver_->clone();
-    else
-      originalSolver_=NULL;
   }
   return *this;
 }

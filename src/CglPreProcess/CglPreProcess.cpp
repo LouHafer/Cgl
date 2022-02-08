@@ -8,6 +8,7 @@
 #include <vector>
 #include <algorithm>
 #include <cfloat>
+#include <climits>
 
 #include "CoinPragma.hpp"
 #include "CglPreProcess.hpp"
@@ -1081,10 +1082,12 @@ static void writeDebugMps(const OsiSolverInterface *solver,
   sprintf(name, "presolve%2.2d.mps", mpsNumber);
   printf("saving %s from %s - %d row, %d columns\n", 
     name, where, solver->getNumRows(), solver->getNumCols());
-  if (mpsNumber>10) {
+  if (mpsNumber>20) {
     printf("Not saving\n");
   } else {
     solver->writeMpsNative(name, NULL, NULL, 0, 1, 0);
+    sprintf(name, "presolve%2.2d.bas", mpsNumber);
+    solver->writeBasisNative(name);
   }
 #if DEBUG_PREPROCESS > 1
   if (pinfo && debugSolution) {
@@ -1218,6 +1221,16 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
   int tuning)
 {
   double ppstart = getCurrentCPUTime();
+#define CGL_TRY_MINI_DUAL_STUFF
+#ifdef CGL_TRY_MINI_DUAL_STUFF
+  if (makeEquality==-2) {
+    OsiPresolve dummy;
+    // Just to do dual stuff using existing coding
+    //printf("start mini\n");
+    dummy.miniPresolvedModel(model);
+    //printf("end mini\n");
+  }
+#endif
 #if DEBUG_PREPROCESS > 1
   bool rcdActive = true;
   std::string modelName;
@@ -1362,6 +1375,7 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
   // probably okay with rowType_ but for now ..
   CoinPackedMatrix matrixByRow(*originalModel_->getMutableMatrixByRow());
   if (!rowType_ && true) {
+    writeDebugMps(originalModel_, "before_scaled", 0);
     // clean matrix
     double *elementByRow = matrixByRow.getMutableElements();
     const int *column = matrixByRow.getIndices();
@@ -1376,7 +1390,7 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
     int nScaled = 0;
     for (int iRow=0;iRow<numberRows;iRow++) {
       int n = 0;
-      // make majority positive
+      // make majority positive (unless upper rhs +1)
       CoinBigIndex start = rowStart[iRow];
       CoinBigIndex end = start+rowLength[iRow];
       double multiplier = 1.0;
@@ -1384,49 +1398,51 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
 	if (elementByRow[j]<0)
 	  n++;
       }
-      if (2*n>end-start)
+      if (2*n>end-start && rowUpper[iRow] != 1.0)
 	multiplier = -1.0;
       int nInRow = end-start;
       n = nInRow;
-      bool allInt = true;
+      double smallest = COIN_DBL_MAX;
       if (multiplier == 1.0) {
 	for (int i=0;i<n;i++) {
 	  double value = elementByRow[i+start];
-	  if (value!=floor(value))
-	    allInt = false;
+	  if (fabs(value) < smallest)
+	    smallest = fabs(value);
 	  temp[i] = value;
 	}
       } else {
 	for (int i=0;i<n;i++) {
 	  double value = elementByRow[i+start];
-	  if (value!=floor(value))
-	    allInt = false;
+	  if (fabs(value) < smallest)
+	    smallest = fabs(value);
 	  temp[i] = -value;
 	}
       }
       double lower = rowLower[iRow];
       double upper = rowUpper[iRow];
-      if (lower>-1.0e20) 
-	temp[n++] = multiplier*lower;
-      if (upper<1.0e20) 
-	temp[n++] = multiplier*upper;
-      memcpy(tempSave,temp,n*sizeof(double));
-      if (!allInt && scaleRowIntegral(temp, n)) {
-	// double check
-	double largestError = 0.0;
-	double mult = temp[0]/elementByRow[start];
-	if (fabs(mult-floor(mult+0.1))<1.0e-12)
-	  mult = floor(mult+0.1);
-	for (int i=0;i<n;i++) {
-	  double value = mult*tempSave[i];
-	  if (value) {
-	    double vint = floor(value+0.01);
-	    largestError = CoinMax(largestError,fabs(value-vint));
-	    assert (fabs(vint)>0.9);
+      if (smallest != 1.0) {
+	if (lower>-1.0e20) 
+	  temp[n++] = multiplier*lower;
+	if (upper<1.0e20) 
+	  temp[n++] = multiplier*upper;
+	memcpy(tempSave,temp,n*sizeof(double));
+	if (scaleRowIntegral(temp, n)) {
+	  // double check
+	  double largestError = 0.0;
+	  double mult = temp[0]/elementByRow[start];
+	  if (fabs(mult-floor(mult+0.1))<1.0e-12)
+	    mult = floor(mult+0.1);
+	  for (int i=0;i<n;i++) {
+	    double value = mult*tempSave[i];
+	    if (value) {
+	      double vint = floor(value+0.01);
+	      largestError = CoinMax(largestError,fabs(value-vint));
+	      assert (fabs(vint)>0.9);
+	    }
 	  }
-	}
-	if (largestError<1.0e-9) {
-	  multiplier = mult;
+	  if (largestError<1.0e-9) {
+	    multiplier = mult;
+	  }
 	}
       }
       element[iRow] = multiplier;
@@ -1477,7 +1493,7 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
       printf("%d rows changed %d scaled - largest error %g\n",
 	     nChanged,nScaled,largestDelta);
 #endif
-      //writeDebugMps(originalModel_, "scaled", 0);
+      writeDebugMps(originalModel_, "scaled", 0);
       delete startModel_;
       startModel_ = originalModel_->clone();
     }
@@ -2013,8 +2029,8 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
     }
     if (allPlus)
       nPossible++;
-    int iUpper = static_cast< int >(floor(upperValue + 1.0e-5));
-    int iLower = static_cast< int >(ceil(lowerValue - 1.0e-5));
+    int iUpper = upperValue > INT_MAX ? INT_MAX : static_cast< int >(floor(upperValue + 1.0e-5));
+    int iLower = lowerValue < INT_MIN ? INT_MIN : static_cast< int >(ceil(lowerValue - 1.0e-5));
     int state = 0;
     if (upperValue < 1.0e6) {
       if (iUpper == 1 - numberM1)
@@ -3639,6 +3655,121 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
     if (debugger)
       assert(returnModel->getRowCutDebugger());
 #endif
+#ifdef SOS_SUB_STUFF
+    // start of sos sub stuff
+    if (returnModel && !rowType_ && (tuning&6) !=0) {
+      int numberColumns = returnModel->getNumCols();
+      int numberRows = returnModel->getNumRows();
+      const CoinPackedMatrix * rowCopy = returnModel->getMatrixByRow();
+      numberRows = rowCopy->getNumRows();
+      const int * column = rowCopy->getIndices();
+      const int * rowLength = rowCopy->getVectorLengths();
+      const CoinBigIndex * rowStart = rowCopy->getVectorStarts();
+      const double * rowLower = returnModel->getRowLower();
+      const double * rowUpper = returnModel->getRowUpper();
+      const double * element = rowCopy->getElements();
+      int *sort = new int[2*numberRows];
+      int *delrows = sort+numberRows;
+      int numberLook = 0;
+      int k = numberRows;
+      for (int i = 0; i < numberRows; i++) {
+	if (rowLength[i] == 0)
+	  continue;
+	bool possible = true;
+	if (rowLower[i]<rowUpper[i])
+	  possible = false;
+	for (CoinBigIndex j=rowStart[i];j<rowStart[i]+rowLength[i];j++) {
+	  if (element[j]!=1.0) {
+	    possible = false;
+	    break;
+	  }
+	}
+	if (possible) 
+	  sort[numberLook++] = i;
+	else
+	  sort[--k] = i;
+      }
+      int numberTotal = numberLook;
+      if (numberLook) {
+	// move others
+	for (int i=k;i<numberRows;i++)
+	  sort[numberTotal++] = sort[i];
+	
+	double *workrow = new double[numberTotal + 1];
+	
+	double *workcol = new double[numberColumns + 1];
+	coin_init_random_vec(workcol, numberColumns);
+	for (int i=0;i<numberTotal;i++) {
+	  double sum = 0.0;
+	  int iRow = sort[i];
+	  for (CoinBigIndex j=rowStart[iRow];j<rowStart[iRow]+rowLength[iRow];j++) {
+	    int iColumn = column[j];
+	    sum += workcol[iColumn];
+	  }
+	  workrow[i] = sum;
+	}
+	CoinSort_2(workrow, workrow + numberLook, sort);
+	CoinSort_2(workrow+numberLook, workrow + numberTotal, sort+numberLook);
+	
+	int numberOut = 0;
+	
+	int iLook = numberLook;
+	for (int kk = 0; kk < numberLook; kk++) {
+	  double dval = workrow[kk];
+	  int ilast = sort[kk];
+	  double req = rowLower[ilast];
+	  for (int jj = iLook; jj < numberTotal; jj++) {
+	    if (workrow[jj] == dval) {
+	      int ithis = sort[jj];
+	      CoinBigIndex krs = rowStart[ithis];
+	      CoinBigIndex kre = krs + rowLength[ithis];
+	      if (rowLength[ithis] == rowLength[ilast]) {
+		CoinBigIndex ishift = rowStart[ilast] - krs;
+		CoinBigIndex k;
+		for (k = krs; k < kre; k++) {
+		  if (column[k] != column[k + ishift]) {
+		    break;
+		  }
+		}
+		if (k == kre) {
+		  /* now check to see if row satisfied */
+		  double rlo2 = rowLower[ithis];
+		  double rup2 = rowUpper[ithis];
+		  for (k = krs; k < kre; k++) {
+		    double value = req*element[k];
+		    if (value<rlo2-feasibilityTolerance ||
+			value>rup2+feasibilityTolerance)
+		      break;
+		  }
+		}
+		if (k == kre) {
+		  delrows[numberOut++] = ithis;
+		}
+	      }
+	    } else if (workrow[jj] < dval) {
+	      iLook++;
+	    } else {
+	      break;
+	    }
+	  }
+	}
+	
+	delete[] workrow;
+	delete[] workcol;
+	
+	if (numberOut) {
+	  char generalPrint[100];
+	  sprintf(generalPrint, "%d more redundant rows found",
+		  numberOut);
+	  handler_->message(CGL_GENERAL, messages_)
+	    << generalPrint
+	    << CoinMessageEol;
+	  returnModel->deleteRows(numberOut,delrows);
+	}
+      }
+      delete[] sort;
+    }
+#endif // end of sos sub stuff
     numberIntegers = 0;
     int numberBinary = 0;
     int numberColumns = returnModel->getNumCols();
@@ -3900,7 +4031,7 @@ CglPreProcess::tightenPrimalBounds(OsiSolverInterface &model,
   const int *rowLength = copy.getVectorLengths();
   double *element = copy.getMutableElements();
   int numberChanged = 1, iPass = 0;
-  double large = model.getInfinity() * 0.1; // treat bounds > this as infinite
+  double large = 1.0e100; // treat bounds > this as infinite
   int numberInfeasible = 0;
   int totalTightened = 0;
 
@@ -3971,7 +4102,7 @@ CglPreProcess::tightenPrimalBounds(OsiSolverInterface &model,
 	model.setRowLower(iRow,-COIN_DBL_MAX);
 	model.setRowUpper(iRow,COIN_DBL_MAX);
       }
-    }    
+    }
     for (int iColumn=0;iColumn<numberColumns;iColumn++) {
       if (cLower[iColumn]>newLower[iColumn]) {
 	newLower[iColumn] = cLower[iColumn];
@@ -3983,7 +4114,7 @@ CglPreProcess::tightenPrimalBounds(OsiSolverInterface &model,
 	columnUpper[iColumn] = cUpper[iColumn];
 	model.setColUpper(iColumn,cUpper[iColumn]);
       }
-    }    
+    }
     delete [] rowStartPos;
     delete [] cLower;
   }
@@ -4057,8 +4188,8 @@ CglPreProcess::tightenPrimalBounds(OsiSolverInterface &model,
         // Build in a margin of error
         maximumUp += 1.0e-8 * fabs(maximumUp);
         maximumDown -= 1.0e-8 * fabs(maximumDown);
-        double maxUp = maximumUp + infiniteUpper * 1.0e31;
-        double maxDown = maximumDown - infiniteLower * 1.0e31;
+        double maxUp = maximumUp + infiniteUpper * 1.0e200;
+        double maxDown = maximumDown - infiniteLower * 1.0e200;
         if (maxUp <= rowUpper[iRow] + tolerance && maxDown >= rowLower[iRow] - tolerance) {
 
           // Row is redundant - make totally free
@@ -4279,6 +4410,8 @@ CglPreProcess::tightenPrimalBounds(OsiSolverInterface &model,
 		    double gap = lower-maxDown;
 		    newBound = newLower[iColumn] + gap/value;
 		  }
+		  if (newBound>1.0e50)
+		    newBound = COIN_DBL_MAX;
 		  if (newBound<newUpper[iColumn]-1.0e-7) {
 		    if (model.isInteger(iColumn)) {
 		      newBound = ceil(newBound);
@@ -4322,6 +4455,8 @@ CglPreProcess::tightenPrimalBounds(OsiSolverInterface &model,
 		    double gap = lower-maxDown;
 		    newBound = newUpper[iColumn] + gap/value;
 		  }
+		  if (newBound<-1.0e50)
+		    newBound = -COIN_DBL_MAX;
 		  if (newBound>newLower[iColumn]+1.0e-7) {
 		    if (model.isInteger(iColumn)) {
 		      newBound = ceil(newBound);
@@ -4424,6 +4559,8 @@ CglPreProcess::tightenPrimalBounds(OsiSolverInterface &model,
         model.setColUpper(iColumn, upper);
         newLower[iColumn] = lower;
         newUpper[iColumn] = upper;
+      } else if (columnUpper[iColumn] < columnLower[iColumn]-1.0e-7) {
+	numberInfeasible++;
       }
     }
     if (!numberInfeasible) {
@@ -5725,6 +5862,13 @@ CglPreProcess::modified(OsiSolverInterface *model,
             rowTypeAll[iRow] = 0;
           }
         }
+      } else {
+	// continuous - take out to be on safe side
+	for (CoinBigIndex j = columnStart[iColumn];
+	     j < columnStart[iColumn] + columnLength[iColumn]; j++) {
+	  int iRow = row[j];
+	  rowTypeAll[iRow] = 0;
+	}
       }
     }
 #if CBC_USEFUL_PRINTING > 0
@@ -5978,7 +6122,8 @@ CglPreProcess::modified(OsiSolverInterface *model,
                   newModel->setColLower(iColumn, 0.0);
                   nMarkRow = 0; // stop looking
                 }
-                if (colLower[0] > colUpper[0] || colLower[1] > colUpper[1] + 1.0e-6) {
+                if (colLower[0] > colUpper[0] + 1.0e-6
+		    || colLower[1] > colUpper[1] + 1.0e-6) {
 #if CBC_USEFUL_PRINTING > 0
                   printf("** infeasible\n");
 #endif
@@ -6597,7 +6742,7 @@ CglPreProcess::modified(OsiSolverInterface *model,
         if (!probingCut) {
           generator_[iGenerator]->generateCuts(*newModel, cs, info);
         } else {
-          info.options = 64;
+          info.options = 64 | 2048;
           probingCut->setMode(useSolution ? 4 : 4 | 64);
           int saveMaxElements = probingCut->getMaxElementsRoot();
           int saveMaxProbe = probingCut->getMaxProbeRoot();
@@ -7532,7 +7677,7 @@ CglPreProcess::modified(OsiSolverInterface *model,
               numberFixed++;
             } else {
               numberBounds++;
-              if (columnLower[iColumn] > columnUpper[iColumn])
+              if (columnLower[iColumn] > columnUpper[iColumn] + 1.0e-12)
                 feasible = false;
             }
           }
@@ -7556,7 +7701,7 @@ CglPreProcess::modified(OsiSolverInterface *model,
               numberFixed++;
             } else {
               numberBounds++;
-              if (columnLower[iColumn] > columnUpper[iColumn])
+              if (columnLower[iColumn] > columnUpper[iColumn]+1.0e-12)
                 feasible = false;
             }
           }
@@ -7940,7 +8085,8 @@ void CglPreProcess::addCutGenerator(CglCutGenerator *generator)
 {
   CglCutGenerator **temp = generator_;
   generator_ = new CglCutGenerator *[numberCutGenerators_ + 1];
-  memcpy(generator_, temp, numberCutGenerators_ * sizeof(CglCutGenerator *));
+  if( numberCutGenerators_ > 0 )
+     memcpy(generator_, temp, numberCutGenerators_ * sizeof(CglCutGenerator *));
   delete[] temp;
   generator_[numberCutGenerators_++] = generator->clone();
 }
@@ -9144,73 +9290,6 @@ CglBK::newSolver(const OsiSolverInterface &model)
   // mark so everything will be deleted
   left_ = -1;
   return newSolver;
-}
-static double multiplier[] = { 1.23456789e2, -9.87654321 };
-static int hashCut(const OsiRowCut &x, int size)
-{
-  int xN = x.row().getNumElements();
-  double xLb = x.lb();
-  double xUb = x.ub();
-  const int *xIndices = x.row().getIndices();
-  const double *xElements = x.row().getElements();
-  unsigned int hashValue;
-  double value = 1.0;
-  if (xLb > -1.0e10)
-    value += xLb * multiplier[0];
-  if (xUb < 1.0e10)
-    value += xUb * multiplier[1];
-  for (int j = 0; j < xN; j++) {
-    int xColumn = xIndices[j];
-    double xValue = xElements[j];
-    int k = (j & 1);
-    value += (j + 1) * multiplier[k] * (xColumn + 1) * xValue;
-  }
-  // should be compile time but too lazy for now
-  if (sizeof(value) > sizeof(hashValue)) {
-    assert(sizeof(value) == 2 * sizeof(hashValue));
-    union {
-      double d;
-      unsigned int i[2];
-    } xx;
-    xx.d = value;
-    hashValue = (xx.i[0] + xx.i[1]);
-  } else {
-    assert(sizeof(value) == sizeof(hashValue));
-    union {
-      double d;
-      unsigned int i[2];
-    } xx;
-    xx.d = value;
-    hashValue = xx.i[0];
-  }
-  return hashValue % (size);
-}
-static bool same(const OsiRowCut &x, const OsiRowCut &y)
-{
-  int xN = x.row().getNumElements();
-  int yN = y.row().getNumElements();
-  bool identical = false;
-  if (xN == yN) {
-    double xLb = x.lb();
-    double xUb = x.ub();
-    double yLb = y.lb();
-    double yUb = y.ub();
-    if (fabs(xLb - yLb) < 1.0e-8 && fabs(xUb - yUb) < 1.0e-8) {
-      const int *xIndices = x.row().getIndices();
-      const double *xElements = x.row().getElements();
-      const int *yIndices = y.row().getIndices();
-      const double *yElements = y.row().getElements();
-      int j;
-      for (j = 0; j < xN; j++) {
-        if (xIndices[j] != yIndices[j])
-          break;
-        if (fabs(xElements[j] - yElements[j]) > 1.0e-12)
-          break;
-      }
-      identical = (j == xN);
-    }
-  }
-  return identical;
 }
 CglUniqueRowCuts::CglUniqueRowCuts(int initialMaxSize, int hashMultiplier)
 {
