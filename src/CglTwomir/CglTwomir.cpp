@@ -204,12 +204,12 @@ void CglTwomir::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
       }
       numberCopy=0;
       numberAdd=0;
-      const double * rowSolution = si.getRowActivity();
-      double offset=0.0;
+      //const double * rowSolution = si.getRowActivity();
+      //double offset=0.0;
       for (int iRow=numberOriginalRows;iRow<numberRows;iRow++) {
 	if (!copy[iRow-numberOriginalRows]) {
 	  double value = pi[iRow];
-	  offset += rowSolution[iRow]*value;
+	  //offset += rowSolution[iRow]*value;
 	  for (CoinBigIndex k=rowStart[iRow];
 	       k<rowStart[iRow]+rowLength[iRow];k++) {
 	    int iColumn=column[k];
@@ -810,6 +810,11 @@ DGG_data_t* DGG_getData(const void *osi_ptr )
         if( DGG_isConstraintBoundedAbove(data,j)) {
           if ( frac_part(rowUpper[i]) > DGG_INTEGRALITY_THRESH )
             goto DONE_ROW; 
+	  // need to check this as well
+	  if( DGG_isConstraintBoundedBelow(data,j)) {
+	    if ( frac_part(rowLower[i]) > DGG_INTEGRALITY_THRESH )
+	      goto DONE_ROW;
+	  }
         }
         else
           if ( frac_part(rowLower[i]) > DGG_INTEGRALITY_THRESH )

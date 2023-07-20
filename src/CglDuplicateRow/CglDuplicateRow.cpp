@@ -2683,7 +2683,7 @@ static int outDupsEtc(int numberIntegers, int numberCliques, int * statusClique,
   CoinSort_2(sort,sort+numberCliques,which);
   int lastDone=-1;
   int nDup=0;
-  int nSave=0;
+  //int nSave=0;
   while (lastDone<numberCliques-1) {
     int jClique=lastDone+1;
     int jFirst = jClique;
@@ -2745,7 +2745,7 @@ static int outDupsEtc(int numberIntegers, int numberCliques, int * statusClique,
 	  if (kClique!=iLowest) {
 	    statusClique[kClique]=-2;
 	    nDup++;
-	    nSave += cliqueStart[kClique+1]-cliqueStart[kClique];
+	    //nSave += cliqueStart[kClique+1]-cliqueStart[kClique];
 	  }
 	}
       }
@@ -2776,13 +2776,13 @@ static int outDupsEtc(int numberIntegers, int numberCliques, int * statusClique,
       statusClique[jClique]=entry[cliqueStart[jClique]];
     }
   }
-  nSave=0;
+  //nSave=0;
   int startLooking=0;
   for (int jClique=0;jClique<numberCliques;jClique++) {
     int kClique = which[jClique];
     if (statusClique[kClique]==-2) {
       nOut++;
-      nSave += cliqueStart[kClique+1]-cliqueStart[kClique];
+      //nSave += cliqueStart[kClique+1]-cliqueStart[kClique];
       if (jClique==startLooking)
 	startLooking++;
       continue;
@@ -2966,7 +2966,7 @@ void CglDuplicateRow::generateCuts8(const OsiSolverInterface & si, OsiCuts & cs,
     for (iRow=0;iRow<numberRows;iRow++) {
       duplicate_[iRow]=-1;
       int numberP1=0;
-      int numberTotal=0;
+      //int numberTotal=0;
       CoinBigIndex j;
       double upperValue=rowUpper[iRow];
       double lowerValue=rowLower[iRow];
@@ -2984,7 +2984,7 @@ void CglDuplicateRow::generateCuts8(const OsiSolverInterface & si, OsiCuts & cs,
 	  break;
 	} else {
 	  iColumn = backward[iColumn];
-	  numberTotal++;
+	  //numberTotal++;
 	}
 	if (value!=1.0) {
 	  good=false;
@@ -3243,7 +3243,7 @@ CglDuplicateRow::refreshSolver(OsiSolverInterface * solver)
   const CoinBigIndex * rowStart = matrixByRow_.getVectorStarts();
   const int * rowLength = matrixByRow_.getVectorLengths();
   int iRow;
-  int numberGood=0;
+  //int numberGood=0;
   int markBad = -(solver->getNumCols()+1);
   for (iRow=0;iRow<numberRows;iRow++) {
     rhs_[iRow]=markBad;
@@ -3266,7 +3266,7 @@ CglDuplicateRow::refreshSolver(OsiSolverInterface * solver)
         lower_[iRow] = static_cast<int> (CoinMax(0.0,ceil(rowLower[iRow])));
         if (iRhs>=lower_[iRow]) {
           rhs_[iRow]=iRhs;
-          numberGood++;
+          //numberGood++;
         } else {
           // infeasible ?
           lower_[iRow]=markBad;

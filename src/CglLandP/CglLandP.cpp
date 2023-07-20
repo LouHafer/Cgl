@@ -512,14 +512,14 @@ struct cutsCos
 void
 CglLandP::scanExtraCuts(OsiCuts& cs, const double * colsol) const
 {
-    int numAdded = 0;
+    //int numAdded = 0;
     for (int i = extraCuts_.sizeRowCuts() - 1; i > -1 ; i--)
     {
         double violation = extraCuts_.rowCut(i).violated(colsol);
         if (violation > 0.)
         {
             cs.insert(extraCuts_.rowCut(i));
-            numAdded++;
+            //numAdded++;
             //      std::cout<<"A cut computed in a previous iteration is violated by "<<violation<<"."<<std::endl;
             //extraCuts_.eraseRowCut(i);
         }
@@ -666,6 +666,8 @@ CglLandP::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
       // update solution and basis
       tt_si->setColSolution(solution);
       tt_si->setWarmStart(basis);
+      delete basis;
+      delete [] solution;
       tt_si->resolve();
       t_si = tt_si;
     }

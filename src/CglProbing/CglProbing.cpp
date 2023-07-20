@@ -26,8 +26,6 @@
 #define FIXED_ALLOWANCE 10
 #define SIZE_ROW_MULT 4
 #define SIZE_ROW_ADD 2000
-#undef FIXED_BOTH_WAYS
-#define FIXED_BOTH_WAYS 1
 #define MANY_TIGHTEN 1
 typedef struct {double infeasibility;int sequence;} double_int_pair;
 class double_int_pair_compare {
@@ -345,9 +343,11 @@ CglProbing::tighten(double *colLower, double * colUpper,
   CoinBigIndex k, krs, kre;
   int dolrows;
   int iflagu, iflagl;
-  int ntotal=0,nchange=1,jpass=0;
+  int /*ntotal=0,*/nchange=1,jpass=0;
   double dmaxup, dmaxdown, dbound;
   int ninfeas=0;
+  // relax tolerance
+  tolerance *= 10.0;
   // For clique stuff
   double * cliqueMin=NULL;
   double * cliqueMax=NULL;
@@ -1231,7 +1231,7 @@ CglProbing::tighten(double *colLower, double * colUpper,
       }
     }
     nchange=ilbred+iubred+nrwdrp;
-    ntotal += nchange;
+    //ntotal += nchange;
     if (ninfeas) break;
   }
   delete [] cliqueMin;
@@ -1759,14 +1759,18 @@ int CglProbing::gutsOfGenerateCuts(const OsiSolverInterface & si,
   const char * intVarOriginal = si.getColType(true);
   char * intVar = CoinCopyOfArray(intVarOriginal,nCols);
   int i;
+#ifndef NDEBUG
   int numberIntegers=0;
+#endif
   CoinMemcpyN(si.getColLower(),nCols,colLower);
   CoinMemcpyN(si.getColUpper(),nCols,colUpper);
   const double * colsol =si.getColSolution();
   // and put reasonable bounds on integer variables
   for (i=0;i<nCols;i++) {
     if (intVar[i]) {
+#ifndef NDEBUG
       numberIntegers++;
+#endif
       if (intVar[i]==2) {
 	// make sure reasonable bounds
 	if (colsol[i]<1.0e10&&colUpper[i]>1.0e12) 
@@ -3622,9 +3626,9 @@ int CglProbing::probe( const OsiSolverInterface & si,
   // Really must clean up arrays
   // Make more efficient when two versions of tightenPrimalBounds
   double * saveFColLower = NULL;
-  double * saveFColUpper;
-  double * saveFRowLower;
-  double * saveFRowUpper;
+  double * saveFColUpper = NULL;
+  double * saveFRowLower = NULL;
+  double * saveFRowUpper = NULL;
   if ((info->options&2048)!=0) {
     saveFColLower = new double [2*nCols+2*nRows];
     saveFColUpper = saveFColLower+nCols;
@@ -3634,11 +3638,11 @@ int CglProbing::probe( const OsiSolverInterface & si,
 #endif
 #ifdef UPDATE_MINR_MAXR
   int * whichRealChange = stackC0+maxStack;
-  whichRealChange = stackC0+maxStack;
 #if FIXED_BOTH_WAYS
   if (doFixedBothWays)
-    whichRealChange += nCols;
+    whichRealChange += 2*nCols;
 #endif
+  assert (whichRealChange+2*maxStack < ((int *)(colsol+nSpace)));;
 #endif
 #else 
   double * colsol = new double[nCols];
@@ -4169,7 +4173,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
       int feasible=0;
       int notFeasible;
       for (iway=0;iway<3;iway ++) {
-        int fixThis=0;
+        //int fixThis=0;
         double objVal=current;
         int goingToTrueBound=0;
         stackC[0]=j;
@@ -4549,7 +4553,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
 		      markC[kcol] = markIt;
 		    }
 		    if (moveUp&&nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 		      if (!onList) {
 			stackC[nstackC]=kcol;
 			saveL[nstackC]=colLower[kcol];
@@ -4618,7 +4622,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
 		      }
 		    }
 		    if (moveDown&&nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 		      if (!onList) {
 			stackC[nstackC]=kcol;
 			saveL[nstackC]=colLower[kcol];
@@ -4734,7 +4738,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
 		      markC[kcol] = markIt;
 		    }
 		    if (moveUp&&nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 		      if (!onList) {
 			stackC[nstackC]=kcol;
 			saveL[nstackC]=colLower[kcol];
@@ -4850,7 +4854,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
 		      markC[kcol] = markIt;
 		    }
 		    if (moveDown&&nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 		      if (!onList) {
 			stackC[nstackC]=kcol;
 			saveL[nstackC]=colLower[kcol];
@@ -4995,7 +4999,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
 		      markC[kcol] = markIt;
 		    }
 		    if (moveUp&&nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 		      if (!onList) {
 			stackC[nstackC]=kcol;
 			saveL[nstackC]=colLower[kcol];
@@ -5066,7 +5070,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
 		      }
 		    }
 		    if (moveDown&&nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 		      if (!onList) {
 			stackC[nstackC]=kcol;
 			saveL[nstackC]=colLower[kcol];
@@ -5182,7 +5186,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
 		      markC[kcol] = markIt;
 		    }
 		    if (nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 		      if (!onList) {
 			stackC[nstackC]=kcol;
 			saveL[nstackC]=colLower[kcol];
@@ -5298,7 +5302,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
 		      markC[kcol] = markIt;
 		    }
 		    if (nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 		      if (!onList) {
 			stackC[nstackC]=kcol;
 			saveL[nstackC]=colLower[kcol];
@@ -5381,7 +5385,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
           }
           istackC++;
         }
-#if FIXED_BOTH_WAY || MANY_TIGHTEN
+#if FIXED_BOTH_WAYS || MANY_TIGHTEN
 	// the nCols<1000 should be on some switch
 	if (!notFeasible && iway < 2 && (info->options&2048)!=0
 	    && nCols<1000) {
@@ -5607,7 +5611,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
           iway=3;
           nfixed++;
           OsiColCut cc;
-          int nTot=0,nFix=0,nInt=0;
+          int /*nTot=0,*/nFix=0,nInt=0;
           bool ifCut=false;
           for (istackC=0;istackC<nstackC;istackC++) {
             int icol=stackC[istackC];
@@ -5624,7 +5628,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
             }
           }
           if (nFix) {
-            nTot=nFix;
+            //nTot=nFix;
 	    cleanBounds(1,nFix,index,element);
             cc.setUbs(nFix,index,element);
             nFix=0;
@@ -5644,7 +5648,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
             }
           }
           if (nFix) {
-            nTot+=nFix;
+            //nTot+=nFix;
 	    cleanBounds(-1,nFix,index,element);
             cc.setLbs(nFix,index,element);
           }
@@ -6210,7 +6214,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
                 markC[icol]=istackC+100000;
               }
               OsiColCut cc;
-              int nTot=0,nFix=0,nInt=0;
+              int /*nTot=0,*/nFix=0,nInt=0;
               bool ifCut=false;
               for (istackC=1;istackC<nstackC0;istackC++) {
                 int icol=stackC0[istackC];
@@ -6243,7 +6247,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
                 }
               }
               if (nFix) {
-                nTot=nFix;
+                //nTot=nFix;
 		cleanBounds(-1,nFix,index,element);
                 cc.setLbs(nFix,index,element);
                 nFix=0;
@@ -6314,7 +6318,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
                 }
               }
               if (nFix) {
-                nTot+=nFix;
+                //nTot+=nFix;
 		cleanBounds(1,nFix,index,element);
                 cc.setUbs(nFix,index,element);
               }
@@ -6790,8 +6794,8 @@ int CglProbing::probe( const OsiSolverInterface & si,
 	CoinBigIndex kre = rowStart[i+1];
         int kInt = -1;
 	double rhsAdjustment=0.0;
-	int nPosInt=0;
-	int nNegInt=0;
+	//int nPosInt=0;
+	//int nNegInt=0;
         double valueInteger=0.0;
         // Find largest integer coefficient
 	CoinBigIndex k;
@@ -6817,14 +6821,14 @@ int CglProbing::probe( const OsiSolverInterface & si,
 	      rhsAdjustment += colUpper[j]*value;
               continue;
             }
-	    if (intVar[j]) {
-	      if (value>0.0)
-		nPosInt++;
-	      else
-		nNegInt++;
-	    } else {
-	      nPosInt = -nCols;
-	    }
+//	    if (intVar[j]) {
+//	      if (value>0.0)
+//		nPosInt++;
+//	      else
+//		nNegInt++;
+//	    } else {
+//	      nPosInt = -nCols;
+//	    }
             if (j!=kInt) {
               // treat as continuous
               if (value > 0.0) {
@@ -6998,7 +7002,7 @@ int CglProbing::probe( const OsiSolverInterface & si,
   delete [] largestPositiveInRow;
   delete [] largestNegativeInRow;
 #endif
-#if FIXED_BOTH_WAY || MANY_TIGHTEN
+#if FIXED_BOTH_WAYS || MANY_TIGHTEN
   delete [] saveFColLower;
 #endif
   delete [] colsol;
@@ -7248,7 +7252,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
 	int feasible=0;
 	int notFeasible;
 	for (iway=0;iway<3;iway ++) {
-	  int fixThis=0;
+	  //int fixThis=0;
 	  double objVal=current;
 	  int goingToTrueBound=0;
 	  stackC[0]=j;
@@ -7402,7 +7406,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
                       // not on list yet
                       if (nstackC<2*maxStack) {
                         markC[kcol] = 3; // say fixed
-                        fixThis++;
+                        //fixThis++;
                         stackC[nstackC]=kcol;
                         saveL[nstackC]=colLower[kcol];
                         saveU[nstackC]=colUpper[kcol];
@@ -7656,7 +7660,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
                       markC[kcol] = markIt;
 		    }
 		    if (moveUp&&nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 #ifdef PRINT_DEBUG
 		      printf("lower bound on %d increased from %g to %g by row %d %g %g\n",kcol,colLower[kcol],newLower,irow,rowLower[irow],rowUpper[irow]);
 		      value=0.0;
@@ -7738,7 +7742,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
 		      }
 		    }
 		    if (moveDown&&nstackC<2*maxStack) {
-		      fixThis++;
+		      //fixThis++;
 #ifdef PRINT_DEBUG
 		      printf("upper bound on %d decreased from %g to %g by row %d %g %g\n",kcol,colUpper[kcol],newUpper,irow,rowLower[irow],rowUpper[irow]);
 		      value=0.0;
@@ -7867,7 +7871,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
 	    nfixed++;
             if (mode_) {
 	      OsiColCut cc;
-	      int nTot=0,nFix=0,nInt=0;
+	      int /*nTot=0,*/nFix=0,nInt=0;
 	      bool ifCut=false;
 	      for (istackC=0;istackC<nstackC;istackC++) {
 		int icol=stackC[istackC];
@@ -7884,7 +7888,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
 		}
 	      }
 	      if (nFix) {
-		nTot=nFix;
+		//nTot=nFix;
 		cleanBounds(1,nFix,index,element);
 		cc.setUbs(nFix,index,element);
 		nFix=0;
@@ -7904,7 +7908,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
 		}
 	      }
 	      if (nFix) {
-		nTot+=nFix;
+		//nTot+=nFix;
 		cleanBounds(-1,nFix,index,element);
 		cc.setLbs(nFix,index,element);
 	      }
@@ -8257,7 +8261,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
 		}
 		if (mode_) {
 		  OsiColCut cc;
-		  int nTot=0,nFix=0,nInt=0;
+		  int /*nTot=0,*/nFix=0,nInt=0;
 		  bool ifCut=false;
 		  for (istackC=0;istackC<nstackC0;istackC++) {
 		    int icol=stackC0[istackC];
@@ -8278,7 +8282,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
 		    }
 		  }
 		  if (nFix) {
-		    nTot=nFix;
+		    //nTot=nFix;
 		    cleanBounds(-1,nFix,index,element);
 		    cc.setLbs(nFix,index,element);
 		    nFix=0;
@@ -8302,7 +8306,7 @@ int CglProbing::probeCliques( const OsiSolverInterface & si,
 		    }
 		  }
 		  if (nFix) {
-		    nTot+=nFix;
+		    //nTot+=nFix;
 		    cleanBounds(1,nFix,index,element);
 		    cc.setUbs(nFix,index,element);
 		  }
