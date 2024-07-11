@@ -28,7 +28,9 @@
 #endif
 #include "CoinRational.hpp"
 #endif
+#ifdef CBC_HAS_CLP
 #define CGL_HAS_CLP_GOMORY
+#endif
 #ifdef CGL_HAS_CLP_GOMORY
 #include "OsiClpSolverInterface.hpp"
 #endif
@@ -336,6 +338,7 @@ void CglGomory::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 	cs.rowCutPtr(i)->setGloballyValid();
     }
   }
+#ifdef CGL_HAS_CLP_GOMORY
   if ((gomoryType_%10)==2) {
     // back to original
     assert(clpSolver);
@@ -349,6 +352,7 @@ void CglGomory::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
       delete [] delRow;
     }
   }
+#endif
 }
 
 // Returns value - floor but allowing for small errors
@@ -869,6 +873,9 @@ CglGomory::generateCuts(
     printf("Gomory limit changed from %d to %d, inTree %c, pass %d, r %d,c %d,e %d\n",
 	   saveLimit,limit,info.inTree ? 'Y' : 'N',info.pass,
 	   numberRows,numberColumns,numberElements);
+#endif
+#if CBC_CHECK_CUT_LENGTH
+  limit = CoinMin(limit,CBC_CHECK_CUT_LENGTH*numberRows);
 #endif
   int nCandidates=0;
   for (iColumn=0;iColumn<numberColumns;iColumn++) {
@@ -1594,6 +1601,9 @@ CglGomory::generateCuts(
 	    bounds[1]=rhs;
 	    if (number>50&&numberNonInteger)
 	      bounds[1] = rhs+tolerance6+1.0e-8*fabs(rhs); // weaken
+#ifndef GOMORY_RELAX_NUMBER
+#define GOMORY_RELAX_NUMBER 5
+#endif
 #if GOMORY_RELAX_NUMBER
 	    else if (number>GOMORY_RELAX_NUMBER&&numberNonInteger>1) 
 	      bounds[1] = rhs+tolerance6+1.0e-8*fabs(rhs); // weaken
@@ -1682,17 +1692,81 @@ CglGomory::generateCuts(
 		  abort();
 	      }
 #endif
+	      if (number>1) {
 #if MORE_GOMORY_CUTS<2
-	      nTotalEls -= number;
-	      cs.insertIfNotDuplicate(rc);
-#else
-	      if(number<saveLimit) {
 		nTotalEls -= number;
 		cs.insertIfNotDuplicate(rc);
-	      } else {
-		longCuts.insertIfNotDuplicate(rc);
-	      }
+#else
+		if(number<saveLimit) {
+		  nTotalEls -= number;
+		  cs.insertIfNotDuplicate(rc);
+		} else {
+		  longCuts.insertIfNotDuplicate(rc);
+		}
 #endif
+	      } else {
+		// singleton row cut!
+		double lb = bounds[0];
+		double ub = bounds[1];
+		double value = packed[0];
+		int iColumn = cutIndex[0];
+		double lbCol = colLower[iColumn];
+		double ubCol = colUpper[iColumn];
+		// turn lb,ub into new bounds on column
+		if (lb==-COIN_DBL_MAX) {
+		  if (value<0) {
+		    lb = ub/value;
+		    if (intVar[iColumn])
+		      lb = ceil(lb-1.0e-4);
+		    ub = ubCol;
+		  } else {
+		    ub = ub/value;
+		    if (intVar[iColumn])
+		      ub = floor(ub+1.0e-4);
+		    lb = lbCol;
+		  }
+		} else if (ub==COIN_DBL_MAX) {
+		  if (value>0) {
+		    lb = lb/value;
+		    if (intVar[iColumn])
+		      lb = ceil(lb-1.0e-4);
+		    ub = ubCol;
+		  } else {
+		    ub = lb/value;
+		    if (intVar[iColumn])
+		      ub = floor(ub+1.0e-4);
+		    lb = lbCol;
+		  }
+		} else {
+		  abort();
+		}
+		if (lb>ub+1.0e-4) {
+		  // infeasible
+		  //printf("CUTinf\n");
+		  OsiRowCut rc;
+		  rc.setRow(0,cutIndex,packed,false);
+		  rc.setLb(1.0);
+		  rc.setUb(0.0);
+		  cs.insertIfNotDuplicate(rc);
+		} else if (lb>lbCol || ub<ubCol) {
+		  if (!intVar[iColumn]) {
+		    // think
+		    //printf("CUTnotint\n");
+		  } else {
+		    OsiColCut cc;
+		    if (lb>lbCol)
+		      cc.setLbs(1,&iColumn,&lb);
+		    if (ub<ubCol)
+		      cc.setUbs(1,&iColumn,&ub);
+		    cs.insert(cc);
+		    //printf("CUT %g<=%g -> %g<= %g\n",
+		    //	   colLower[iColumn],colUpper[iColumn],
+		    //   lb,ub);
+		  }
+		} else {
+		//printf("CUT whynone\n");
+		}
+	      }
 	      //printf("nTot %d kCol %d iCol %d ibasic %d\n",
 	      //     nTotalEls,kColumn,iColumn,iBasic);
 	      numberAdded++;

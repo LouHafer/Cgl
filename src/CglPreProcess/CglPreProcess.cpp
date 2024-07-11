@@ -24,9 +24,12 @@
 #include "CoinBuild.hpp"
 #include "CoinHelperFunctions.hpp"
 #include "CoinWarmStartBasis.hpp"
+#ifdef CBC_HAS_CLP
 #include "OsiClpSolverInterface.hpp"
+#endif
 #include "CglProbing.hpp"
 #include "CglDuplicateRow.hpp"
+#include "CoinPresolveDupcol.hpp"
 #include "CglClique.hpp"
 //#define PRINT_DEBUG 1
 //#define COIN_DEVELOP 1
@@ -3598,6 +3601,7 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
 	int change = tightenPrimalBounds(*newModel,true,scBound);
 	if (change > 0)
 	  numberChanges += change;
+#ifdef CBC_HAS_CLP
 	OsiClpSolverInterface * clpSolver = dynamic_cast<OsiClpSolverInterface *>(newModel);
 	if (clpSolver) {
 	  change = clpSolver->tightenBounds();
@@ -3606,6 +3610,7 @@ CglPreProcess::preProcessNonDefault(OsiSolverInterface &model,
 	    //printf("Clp tightenBounds tightened %d\n",change);
 	  }
 	}
+#endif
       }
  #if DEBUG_PREPROCESS > 1
        if (debugger)
@@ -5714,9 +5719,9 @@ void CglPreProcess::postProcess(OsiSolverInterface &modelIn, int deleteStuff)
 #endif
 	    if (scBound) {
               double value = solutionM[iColumn];
-	      int jColumn = original[iColumn];
-	      if (scBound[jColumn]!=-COIN_DBL_MAX) {
-		double lower =scBound[jColumn];
+	      int jColumn2 = original[iColumn];
+	      if (scBound[jColumn2]!=-COIN_DBL_MAX) {
+		double lower =scBound[jColumn2];
 		assert (value<1.0e-5||value>lower-1.0e-5);
 		if (value<1.0e-5) { 
 		  modelM2->setColUpper(jColumn,0.0);
@@ -6412,7 +6417,7 @@ CglPreProcess::modified(OsiSolverInterface *model,
                   lower1[1] = CoinMax(lower1[1], u / el[1][1]);
                   upper1[1] = CoinMin(upper1[1], l / el[1][1]);
                 }
-                if (CoinMin(lower1[0], lower1[1]) > colLower[1]) {
+                if (CoinMin(lower1[0], lower1[1]) > colLower[1] + 1.0e-6) {
 #if CBC_USEFUL_PRINTING > 0
                   printf("for jColumn1 0-bounds %g,%g 1-bounds %g,%g\n",
                     lower1[0], upper1[0], lower1[1], upper1[1]);
@@ -6427,7 +6432,7 @@ CglPreProcess::modified(OsiSolverInterface *model,
                   colLower[1] = value;
                   newModel->setColLower(jColumn1, value);
                 }
-                if (CoinMax(upper1[0], upper1[1]) < colUpper[1]) {
+                if (CoinMax(upper1[0], upper1[1]) < colUpper[1] - 1.0e-6) {
 #if CBC_USEFUL_PRINTING > 0
                   printf("for jColumn1 0-bounds %g,%g 1-bounds %g,%g\n",
                     lower1[0], upper1[0], lower1[1], upper1[1]);
@@ -6442,7 +6447,7 @@ CglPreProcess::modified(OsiSolverInterface *model,
                   colUpper[1] = value;
                   newModel->setColUpper(jColumn1, value);
                 }
-                if (lower1[0] > colUpper[1] || upper1[0] < colLower[1]) {
+                if (lower1[0] > colUpper[1] + 1.0e-6 || upper1[0] < colLower[1] - 1.0e-6) {
 #if CBC_USEFUL_PRINTING > 0
                   printf("for jColumn1 0-bounds %g,%g 1-bounds %g,%g\n",
                     lower1[0], upper1[0], lower1[1], upper1[1]);
@@ -6452,7 +6457,7 @@ CglPreProcess::modified(OsiSolverInterface *model,
                   newModel->setColLower(iColumn, 1.0);
                   nMarkRow = 0; // stop looking
                 }
-                if (lower1[1] > colUpper[1] || upper1[1] < colLower[1]) {
+                if (lower1[1] > colUpper[1] + 1.0e-6 || upper1[1] < colLower[1] - 1.0e-6) {
 #if CBC_USEFUL_PRINTING > 0
                   printf("for jColumn1 0-bounds %g,%g 1-bounds %g,%g\n",
                     lower1[0], upper1[0], lower1[1], upper1[1]);
@@ -6462,8 +6467,7 @@ CglPreProcess::modified(OsiSolverInterface *model,
                   newModel->setColLower(iColumn, 0.0);
                   nMarkRow = 0; // stop looking
                 }
-                if (colLower[0] > colUpper[0] + 1.0e-6
-		    || colLower[1] > colUpper[1] + 1.0e-6) {
+                if (colLower[0] > colUpper[0] + 1.0e-6 || colLower[1] > colUpper[1] + 1.0e-6) {
 #if CBC_USEFUL_PRINTING > 0
                   printf("** infeasible\n");
 #endif
@@ -7094,6 +7098,10 @@ CglPreProcess::modified(OsiSolverInterface *model,
             probingCut->setMaxProbeRoot(CoinMax(saveMaxProbe, 1000));
             probingCut->setMaxElementsRoot(CoinMax(saveMaxElements, 2000));
 	    int maxLook = CoinMin(numberColumns, numberRows)/2;
+	    if ((options_&16)!=0) {
+	      maxLook = numberColumns;
+	      info.options |= 32768;
+	    }
 	    maxLook = CoinMin(maxLook,2000);
             probingCut->setMaxLookRoot(CoinMax(saveMaxLook, maxLook));
             options_ &= ~16;
