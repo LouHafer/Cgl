@@ -300,7 +300,7 @@ void CglFlowCover::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
       hasCut = generateOneFlowCut(si, rowLen, ind, coef, 'L', 
 				  thisRhs, flowCut1, violation);
       if (hasCut)  {                         // If find a cut
-	cs.insertIfNotDuplicate(flowCut1);
+	cs.insertIfNotDuplicateAndClean(flowCut1,41);
 	incNumFlowCuts();
 	if (getNumFlowCuts() >= getMaxNumCuts())
 	  break;
@@ -309,7 +309,7 @@ void CglFlowCover::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
       hasCut = generateOneFlowCut(si, rowLen, ind, coef, 'G', 
 				  thisRhs, flowCut2, violation);
       if (hasCut)  {
-	cs.insertIfNotDuplicate(flowCut2);
+	cs.insertIfNotDuplicateAndClean(flowCut2,42);
 	incNumFlowCuts();
 	if (getNumFlowCuts() >= getMaxNumCuts())
 	  break;
@@ -319,7 +319,7 @@ void CglFlowCover::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
       hasCut = generateOneFlowCut(si, rowLen, ind, coef, sense[iRow], 
 				  thisRhs, flowCut3, violation);
       if (hasCut)  {
-	cs.insertIfNotDuplicate(flowCut3);
+	cs.insertIfNotDuplicateAndClean(flowCut3,43);
 	incNumFlowCuts();
 	if (getNumFlowCuts() >= getMaxNumCuts())
 	  break;
@@ -995,16 +995,16 @@ CglFlowCover::generateOneFlowCut( const OsiSolverInterface & si,
   }
 
   /* Get ml */
-  double ml = CoinMin(sum, lambda);
+  double ml = std::min(sum, lambda);
   if(CGLFLOW_DEBUG) {
     // sum = sum_{i in C+\C++} m_i + sum_{i in L--} m_i = m. Page 15.
-    std::cout << "ml = CoinMin(m, lambda) = CoinMin(" << sum << ", " << lambda << ") =" << ml << std::endl; 
+    std::cout << "ml = std::min(m, lambda) = std::min(" << sum << ", " << lambda << ") =" << ml << std::endl; 
   }
   /* rho_i = max[0, m_i - (minPlsM - lamda) - ml */
   if (t < index ) { /* rho exits only for t <= index-1 */
     value = (minPlsM - lambda) + ml;
     for (i = t; i < index; ++i) {
-      rho[i] =  CoinMax(0.0, mt[i] - value);
+      rho[i] =  std::max(0.0, mt[i] - value);
       if(CGLFLOW_DEBUG) {
 	std::cout << "rho[" << std::setw(5) << i << "]=" << std::setw(20) << rho[i] << std::endl;
       }

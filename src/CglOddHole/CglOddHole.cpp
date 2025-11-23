@@ -53,7 +53,7 @@ void CglOddHole::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
   } else {
     // initialize and extend rows to current size
     memset(checkRow,0,nRows*sizeof(int));
-    memcpy(checkRow,suitableRows_,CoinMin(nRows,numberRows_)*sizeof(int));
+    memcpy(checkRow,suitableRows_,std::min(nRows,numberRows_)*sizeof(int));
   }
   temp.createRowList(si,checkRow);
   // now cut down further by only allowing rows with fractional solution
@@ -68,9 +68,9 @@ void CglOddHole::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 
   // At present I am using new and delete as easier to see arrays in debugger
   int * fixed = new int[nCols]; // mark fixed columns 
-
+  const char * intVar = si.getColType();
   for (i=0;i<nCols;i++) {
-    if (si.isBinary(i) ) {
+    if (intVar[i]==1) {
       fixed[i]=0;
       if (colupper[i]-collower[i]<epsilon_) {
 	solution[i]=0.0;
@@ -322,7 +322,7 @@ void CglOddHole::generateCuts(const OsiRowCutDebugger * /*debugger*/,
   double * hash = reinterpret_cast<double *> (malloc(maxcuts*sizeof(double)));
   // to clean (should not be needed)
   int * clean = new int[nSmall2];
-  int * candidate = new int[CoinMax(nSmall2,nCols)];
+  int * candidate = new int[std::max(nSmall2,nCols)];
   double * element = new double[nCols];
   // in case we want to sort
   double_double_int_triple * sortit = 
@@ -510,7 +510,7 @@ void CglOddHole::generateCuts(const OsiRowCutDebugger * /*debugger*/,
 		}
 		// sort 
 		std::sort(sortit,sortit+nincut,double_double_int_triple_compare());
-		nincut = CoinMin(nincut,maximumEntries_);
+		nincut = std::min(nincut,maximumEntries_);
 		sum=0.0;
 		for (k=0;k<nincut;k++) {
 		  int jcol=sortit[k].sequence;
@@ -621,6 +621,7 @@ void CglOddHole::createRowList( const OsiSolverInterface & si,
       suitableRows_[i]=1;
     }
   }
+  const char * intVar = si.getColType();
   for (rowIndex=0; rowIndex<nRows; rowIndex++){
     double rhs1=rowupper[rowIndex];
     double rhs2=rowlower[rowIndex];
@@ -632,7 +633,7 @@ void CglOddHole::createRowList( const OsiSolverInterface & si,
 	int thisCol=column[i];
 	if (colupper[thisCol]-collower[thisCol]>epsilon_) {
 	  // could allow general integer variables but unlikely
-	  if (!si.isBinary(thisCol) ) {
+	  if (intVar[thisCol] !=1) {
 	    goodRow=false;
 	    break;
 	  }
@@ -837,6 +838,8 @@ CglOddHole::setMaximumEntries(int value)
 
 // This can be used to refresh any inforamtion
 void 
-CglOddHole::refreshSolver(OsiSolverInterface * )
+CglOddHole::refreshSolver(OsiSolverInterface * solver)
 {
+  // Get integer information
+  solver->getColType(true);
 }

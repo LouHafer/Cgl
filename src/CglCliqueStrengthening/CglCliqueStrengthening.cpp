@@ -321,8 +321,21 @@ void CglCliqueStrengthening::cliqueExtension(size_t extMethod, CoinCliqueSet *ne
     const size_t clqSize = cliqueRows_->nz(i);
 
 #ifdef DEBUGCG
-    CoinCliqueList::validateClique(cgraph_, clqIdx, clqSize);
+    bool goodClique = CoinCliqueList::validateClique(cgraph_, clqIdx, clqSize);
+#else
+    bool goodClique = true;
+    for (size_t k = 0; k < clqSize - 1; k++) {
+      for (size_t j = k + 1; j < clqSize; j++) {
+	if ((!cgraph_->conflicting(clqIdx[k], clqIdx[j])) || (clqIdx[k] == clqIdx[j])) {
+	  //fprintf(stderr, "ERROR: Nodes %ld and %ld are not in conflict.\n", clqIdx[k], clqIdx[j]);
+	  goodClique = false;
+	}
+      }
+    }
 #endif
+    if (!goodClique)
+      continue;
+    
 
     if (cliqueRows_->status(i) == Dominated) {
         continue;
@@ -513,7 +526,7 @@ void CglCliqueStrengthening::addStrongerCliques(const CoinCliqueSet *newCliques)
   CoinBigIndex *nrStart = (CoinBigIndex*)xmalloc(sizeof(CoinBigIndex) * (nCliques + 1)); nrStart[0] = 0;
   double *nrLB = (double*)xmalloc(sizeof(double) * nCliques);
   double *nrUB = (double*)xmalloc(sizeof(double) * nCliques);
-
+  bool feasible = true;
   for (size_t ic = 0; ic < nCliques; ic++) {
     const size_t extClqSize = newCliques->cliqueSize(ic);
     const size_t *extClqEl = newCliques->cliqueElements(ic);
@@ -549,7 +562,11 @@ void CglCliqueStrengthening::addStrongerCliques(const CoinCliqueSet *newCliques)
       }
     }
 
-    assert(duplicated == 0 || duplicated == 1);
+    if (duplicated>1) {
+      // infeasible - I think - but better than assert anyway
+      feasible = false;
+      break;
+    }
     if(duplicated == 1) {
       CoinBigIndex last = nrStart[ic];
       rhs = 0.0;
@@ -574,14 +591,18 @@ void CglCliqueStrengthening::addStrongerCliques(const CoinCliqueSet *newCliques)
     nrUB[ic] = rhs;
     nrStart[ic + 1] = numVars;
   }
-
-  // adding rows
-  const int lastOrigIdx = model_->getNumRows();
-  model_->addRows(nCliques, nrStart, nrIdx, nrCoef, nrLB, nrUB);
-
-  // setting names
-  for (int i = 0; i < (int)nCliques; i++) {
-    model_->setRowName(lastOrigIdx + i, rowClqNames_[i]);
+  if (feasible) {
+    // adding rows
+    const int lastOrigIdx = model_->getNumRows();
+    model_->addRows(nCliques, nrStart, nrIdx, nrCoef, nrLB, nrUB);
+    
+    // setting names
+    for (int i = 0; i < (int)nCliques; i++) {
+      model_->setRowName(lastOrigIdx + i, rowClqNames_[i]);
+    }
+  } else {
+    // if infeasible add a bad row
+    model_->addRow(0,NULL,NULL,1.0,0.0);
   }
 
   free(nrIdx);

@@ -1080,7 +1080,7 @@ void CglRedSplit2::reduce_workNonBasicTab(int numRowsReduction,
 					  CglRedSplit2Param::RowSelectionStrategy rowSelectionStrategy,
 					  int maxIterations) {
   // Use at most this number of rows
-  int maxRowsReduction = CoinMin(numRowsReduction, mTab);
+  int maxRowsReduction = std::min(numRowsReduction, mTab);
   if (maxRowsReduction == 1){
     return;
   }
@@ -1327,7 +1327,7 @@ void CglRedSplit2::generate_row(int index_row, double *row) {
     }
   }
   for (int i=0;i<nrow+ncol;i++) {
-    assert (fabs(row[i]-rowTemp[i])<1.0e-11+1.0e-8*CoinMax(fabs(row[i]),fabs(rowTemp[i])));
+    assert (fabs(row[i]-rowTemp[i])<1.0e-11+1.0e-8*std::max(fabs(row[i]),fabs(rowTemp[i])));
   }
   delete [] rowTemp;
 #else
@@ -1480,9 +1480,9 @@ int CglRedSplit2::check_dynamism(double *row) {
 
   for(i=0; i<ncol; i++) {
     val = fabs(row[i]);
-    max_val = CoinMax(max_val, val);
+    max_val = std::max(max_val, val);
     if(val > param.getEPS_COEFF()) {
-      min_val = CoinMin(min_val, val);
+      min_val = std::min(min_val, val);
     }
   }
 
@@ -1532,10 +1532,10 @@ int CglRedSplit2::generate_packed_row(const double *lclXlp,
       }
     } else {
       if (value > 0.0) {
-        rhs -= value * colLower[i];
+        rhs -= value * std::max(colLower[i],-1.0e20);
       } 
       else {
-        rhs -= value * colUpper[i];      
+        rhs -= value * std::min(colUpper[i],1.0e20);      
       } 
     }
   }
@@ -1586,7 +1586,7 @@ void CglRedSplit2::generateCuts(const OsiSolverInterface &si, OsiCuts & cs,
     printf("### WARNING: CglRedSplit2::generateCuts(): no optimal basis available.\n");
     return;
   }
-
+  solver->getColType(true);
   // Reset some members of CglRedSplit2
   card_intBasicVar = 0;
   card_intBasicVar_frac = 0;
@@ -2111,7 +2111,7 @@ int CglRedSplit2::generateCuts(OsiCuts* cs, int maxNumCuts, int* lambda)
 		      }
 		      rc.setUb(tabrowrhs + adjust);   
 		      // relax the constraint slightly
-		      buffcs->insertIfNotDuplicate(rc, CoinAbsFltEq(param.getEPS()));
+		      buffcs->insertIfNotDuplicateAndClean(rc, 51, CoinAbsFltEq(param.getEPS()));
 		      numCuts = buffcs->sizeRowCuts() - initNumCuts;
 #if CBC_CHECK_CUT_LENGTH
 		    }
@@ -2137,7 +2137,7 @@ int CglRedSplit2::generateCuts(OsiCuts* cs, int maxNumCuts, int* lambda)
     // also delete temp data
     if (buffcs){
       for (int i = 0; i < numCuts && i < maxNumCuts; ++i){
-	cs->insertIfNotDuplicate(buffcs->rowCut(quality[i].index),
+	cs->insertIfNotDuplicateAndClean(buffcs->rowCut(quality[i].index),52,
 				 CoinAbsFltEq(param.getEPS_COEFF()));
       }
       delete buffcs;
@@ -2194,9 +2194,9 @@ void CglRedSplit2::setParam(const CglRedSplit2Param &source) {
 void CglRedSplit2::compute_is_integer() {
 
   int i;
-
+  const char * intVar = solver->getColType();
   for(i=0; i<ncol; i++) {
-    if(solver->isInteger(i)) {
+    if(intVar[i]) {
       is_integer[i] = 1;
     }
     else {
@@ -2971,11 +2971,12 @@ void CglRedSplit2::fill_workNonBasicTab(const int* newnonbasics,
   }
   i = 0;
 #endif
+  const char * intVar = solver->getColType();
   // In workNonBasicTab, we write the new nonbasic columns given by the
   // Lift & Project algorithm, scaled by the value of the fractional solution.
   while (newnonbasics[i] >= 0){
     currvar = newnonbasics[i];
-    if (currvar < ncol && solver->isInteger(currvar)){
+    if (currvar < ncol && intVar[currvar]){
       for (colpos = 0; colpos < card_intNonBasicVar; ++colpos){
 	if (intNonBasicVar[colpos] == currvar){
 #ifdef RS2_TRACE

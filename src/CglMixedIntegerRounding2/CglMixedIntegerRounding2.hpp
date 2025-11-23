@@ -169,11 +169,11 @@ public:
   //@{
   /// Set MAXAGGR_
   inline void setMAXAGGR_ (int maxaggr) {
-    if (maxaggr > 0 || maxaggr == -1) {
+    if (maxaggr > 0 || maxaggr == -1 || maxaggr ==-2) {
       MAXAGGR_ = maxaggr;
     }
     else {
-      throw CoinError("Unallowable value. maxaggr must be > 0",
+      throw CoinError("Unallowable value. maxaggr must not be 0",
                       "gutsOfConstruct","CglMixedIntegerRounding2");
     }
   }
@@ -412,6 +412,8 @@ private:
   char * sense_;
   // RHS of rows (modified if ranges)
   double * RHS_;
+  // Pointer to info
+  const CglTreeInfo *info_;
 };
 
 //#############################################################################

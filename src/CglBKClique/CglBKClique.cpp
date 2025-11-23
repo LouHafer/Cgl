@@ -25,7 +25,6 @@
 #include "CglBKClique.hpp"
 #include "CoinConflictGraph.hpp"
 #include "CoinStaticConflictGraph.hpp"
-#include "CoinBronKerbosch.hpp"
 #include "CoinCliqueList.hpp"
 #include "CoinCliqueExtender.hpp"
 #include "CoinCutPool.hpp"
@@ -38,8 +37,8 @@ double CglBKClique::sepTime_ = 0.0;
 
 static void *xmalloc( const size_t size );
 
-CglBKClique::CglBKClique() : cap_(0), maxCallsBK_(1000),
-extMethod_(4), minFrac_(0.001), minViol_(0.02), pivotingStrategy_(3)
+CglBKClique::CglBKClique() : cap_(0), minFrac_(0.001), minViol_(0.02),
+pivotingStrategy_(CoinBronKerbosch::PivotingStrategy::Weight), extMethod_(4), maxCallsBK_(1000)
 {
     minWeight_ = floor(BKCLQ_MULTIPLIER + (minViol_ * BKCLQ_MULTIPLIER));
     vertexWeight_ = NULL;
@@ -110,6 +109,8 @@ CglBKClique::~CglBKClique() {
 
 void CglBKClique::refreshSolver(OsiSolverInterface *solver) {
 	solver->checkCGraph();
+  // Get integer information
+	solver->getColType(true);
 }
 
 CglCutGenerator * CglBKClique::clone() const {
@@ -117,9 +118,9 @@ CglCutGenerator * CglBKClique::clone() const {
 }
 
 void CglBKClique::generateCuts(const OsiSolverInterface &si, OsiCuts &cs, const CglTreeInfo info) {
-	if (si.getNumCols() == 0 || si.getNumRows() == 0) {
-        return;
-    }
+  if (si.getNumCols() == 0 || si.getNumRows() == 0) {
+    return;
+  }
     
     double startSep = CoinCpuTime();
     const CoinConflictGraph *cgraph = si.getCGraph();
@@ -394,7 +395,7 @@ void CglBKClique::setMinViol(const double minViol){
     minWeight_ = BKCLQ_MULTIPLIER + (minViol_ * BKCLQ_MULTIPLIER);
 }
 
-void CglBKClique::setPivotingStrategy(const size_t pivotingStrategy) {
+void CglBKClique::setPivotingStrategy(const CoinBronKerbosch::PivotingStrategy pivotingStrategy) {
     pivotingStrategy_ = pivotingStrategy;
 }
 

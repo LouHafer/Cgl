@@ -735,8 +735,8 @@ bool CglGMI::checkDynamism(const double* cutElem, const int* cutIndex,
   for (int i = 0; i < cutNz; ++i) {
     if (!isZero(cutElem[i])) {
       val = fabs(cutElem[i]);
-      min = CoinMin(min, val);
-      max = CoinMax(max, val);
+      min = std::min(min, val);
+      max = std::max(max, val);
     }
   }
   if (max > min*param.getMAXDYN()) {
@@ -781,7 +781,7 @@ bool CglGMI::removeSmallCoefficients(double* cutElem, int* cutIndex,
       } 
       else if ((value < 0.0) && (colUpper[col] < param.getINFINIT())) {
         cutRhs -= value * colUpper[col];      
-      } 
+      }
     }
     else if (absval > param.getEPS_COEFF()) {
       if (currPos < i) {
@@ -821,7 +821,7 @@ bool CglGMI::scaleCut(double* cutElem, int* cutIndex, int cutNz,
     double max = fabs(cutRhs);
     for (int i = 0; i < cutNz; ++i) {
       if (!isZero(cutElem[i])) {
-	max = CoinMax(max, fabs(cutElem[i]));
+	max = std::max(max, fabs(cutElem[i]));
       }
     }
     if (max < param.getEPS() || max > param.getMAXDYN()) {
@@ -884,15 +884,15 @@ bool CglGMI::scaleCut(double* cutElem, int* cutIndex, int cutNz,
 /************************************************************************/
 bool CglGMI::scaleCutIntegral(double* cutElem, int* cutIndex, int cutNz,
 			      double& cutRhs) {
-  long gcd, lcm;
+  int64_t gcd, lcm;
   double maxdelta = param.getEPS(); 
   double maxscale = 1000; 
-  long maxdnom = 1000; 
-  long numerator = 0, denominator = 0;
+  int64_t maxdnom = 1000;
+  int64_t numerator = 0, denominator = 0;
   // Initialize gcd and lcm
   CoinRational r = CoinRational(cutRhs, maxdelta, maxdnom);
   if (r.getNumerator() != 0){
-     gcd = labs(r.getNumerator());
+     gcd = llabs(r.getNumerator());
      lcm = r.getDenominator();
   }
   else{
@@ -933,13 +933,13 @@ bool CglGMI::scaleCutIntegral(double* cutElem, int* cutIndex, int cutNz,
 } /* scaleCutIntegral */
 
 /************************************************************************/
-long CglGMI::computeGcd(long a, long b) {
+int64_t CglGMI::computeGcd(int64_t a, int64_t b) {
   // This is the standard Euclidean algorithm for gcd
-  long remainder = 1;
+  int64_t remainder = 1;
   // Make sure a<=b (will always remain so)
   if (a > b) {
     // Swap a and b
-    long temp = a;
+    int64_t temp = a;
     a = b;
     b = temp;
   }
@@ -1030,7 +1030,7 @@ void CglGMI::generateCuts(OsiCuts &cs)
   for (int i = 0; i < ncol; ++i) {
     // j is the variable which is basic in row i
     if ((cstat[i] == 1) && (isInteger[i])) {
-      if (CoinMin(aboveInteger(xlp[i]),
+      if (std::min(aboveInteger(xlp[i]),
 		  1-aboveInteger(xlp[i])) > param.getAway()) {
 	listFracBasic[numFracBasic] = i;
 	numFracBasic++;
@@ -1259,15 +1259,24 @@ void CglGMI::generateCuts(OsiCuts &cs)
     }
 #endif
     if (cleanCut(cutElem, cutIndex, cutNz, cutRhs, xlp) && cutNz > 0) {
+      // relax if integer values can be large
+      for (int i=0;i<cutNz;i++) {
+	int j = cutIndex[i];
+	if (isInteger[j]) {
+	  double difference = colUpper[j]-colLower[j];
+	  if (difference > 10.0) 
+	    cutRhs += 1.0e-8*difference;
+	}
+      }
       OsiRowCut rc;
       rc.setRow(cutNz, cutIndex, cutElem);
       rc.setLb(-param.getINFINIT());
       rc.setUb(cutRhs);
       if (!param.getCHECK_DUPLICATES()) {
-	cs.insertIfNotDuplicate(rc);
+	cs.insertIfNotDuplicateAndClean(rc,21);
       }
       else{
-	cs.insertIfNotDuplicate(rc, CoinAbsFltEq(param.getEPS_COEFF()));
+	cs.insertIfNotDuplicateAndClean(rc, 22, CoinAbsFltEq(param.getEPS_COEFF()));
       }
     }
 

@@ -39,7 +39,7 @@ class CoinWarmStartBasis;
 #define  t_min  data->cparams.t_min
 #define  a_max  data->cparams.a_max
 #define  max_elements  data->cparams.max_elements
-
+//#define CGL_DEBUG
 #ifdef CGL_DEBUG
 // Declarations and defines for debug build.
 
@@ -80,7 +80,6 @@ void testus( DGG_constraint_t *cut){ //!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 #define talk false
 
 #endif	// CGL_DEBUG
-
 
 //-------------------------------------------------------------------
 // Generate  cuts
@@ -328,7 +327,7 @@ void CglTwomir::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
   else
     {if(talk) printf ("2mir_test: debug success\n");}
 #endif
-  
+  const char * intVar = si.getColType();
   int i;
   for ( i=0; i<cut_list.n; i++){
     DGG_constraint_t *cut = cut_list.c[i];
@@ -392,8 +391,8 @@ void CglTwomir::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 	  } else {
 	    int iColumn = cutIndex[i];
 	    if (colUpper[iColumn]!=colLower[iColumn]) {
-	      largest=CoinMax(largest,value);
-	      smallest=CoinMin(smallest,value);
+	      largest=std::max(largest,value);
+	      smallest=std::min(smallest,value);
 	      cutIndex[number]=cutIndex[i];
 	      packed[number++]=packed[i];
 	    } else {
@@ -402,12 +401,12 @@ void CglTwomir::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 	    }
 	  }
 	}
-	if (largest<1.0e8*smallest&&goodCut) {
+	if (largest<1.0e8*smallest&&smallest>1.0e-5&&goodCut) {
 	  if (number > 1) {
 	    rowcut.setRow(number, cutIndex, packed);
 	    rowcut.setUb(si.getInfinity());
 	    rowcut.setLb(rhs);
-	    cs.insertIfNotDuplicate(rowcut);
+	    cs.insertIfNotDuplicateAndClean(rowcut,61);
 	  } else {
 	    // singleton row cut!
 	    double lb = rhs;
@@ -416,7 +415,7 @@ void CglTwomir::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 	    int iColumn = cutIndex[0];
 	    double lbCol = colLower[iColumn];
 	    double ubCol = colUpper[iColumn];
-	    bool isInteger =  si.isInteger(iColumn);
+	    bool isInteger =  intVar[iColumn]!=0;
 	    // turn lb,ub into new bounds on column
 	    if (value>0) {
 	      lb = lb/value;
@@ -436,7 +435,7 @@ void CglTwomir::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 	      rc.setRow(0,cutIndex,packed,false);
 	      rc.setLb(1.0);
 	      rc.setUb(0.0);
-	      cs.insertIfNotDuplicate(rc);
+	      cs.insertIfNotDuplicateAndClean(rc,62);
 	    } else if (lb>lbCol || ub<ubCol) {
 	      if (!isInteger) {
 		// think
@@ -461,7 +460,7 @@ void CglTwomir::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 	rowcut.setRow(cut->nz, cut->index, cut->coeff);
 	rowcut.setUb(si->getInfinity());
 	rowcut.setLb(cut->rhs);
-	cs.insertIfNotDuplicate(rowcut);
+	cs.insertIfNotDuplicateAndClean(rowcut,63);
 #endif
       }
     
@@ -476,7 +475,6 @@ void CglTwomir::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 #endif
     }
   }
-  
   for ( i=0; i<cut_list.n; i++)
     DGG_freeConstraint (cut_list.c[i]);
   DGG_list_free (&cut_list);
@@ -586,8 +584,8 @@ CglTwomir::CglTwomir (const CglTwomir & source) :
   form_nrows_(source.form_nrows_)
 {
   probname_ = source.probname_ ;
-  if (source.originalSolver_)
-    originalSolver_ = source.originalSolver_->clone();
+  // already done by CglCutGenerator if (source.originalSolver_)
+  //originalSolver_ = source.originalSolver_->clone();
 }
 
 //-------------------------------------------------------------------
@@ -630,6 +628,11 @@ CglTwomir::operator=(const CglTwomir& rhs)
     max_elements_=rhs.max_elements_;
     max_elements_root_ = rhs.max_elements_root_;
     form_nrows_=rhs.form_nrows_;
+    delete originalSolver_;
+    if (rhs.originalSolver_)
+      originalSolver_ = rhs.originalSolver_->clone();
+    else
+      originalSolver_=NULL;
   }
   return *this;
 }
@@ -744,6 +747,7 @@ DGG_data_t* DGG_getData(const void *osi_ptr )
   data->constrainttemp1_ = DGG_newConstraint(total);
   data->vector0_ = new CoinIndexedVector(data->nrow);
   data->vector1_ = new CoinIndexedVector(data->nrow);
+  const char * intVar = si->getColType();
   //data->spareArray0_ = reinterpret_cast<double*> (malloc( sizeof(double)*total));
   //memset(data->spareArray0_,0,sizeof(double)*total);
 #endif
@@ -784,7 +788,7 @@ DGG_data_t* DGG_getData(const void *osi_ptr )
 
 
     /* is variable integer */
-    if ( si->isInteger(i) ){
+    if ( intVar[i] ){
       data->ninteger++;
       DGG_setIsInteger(data,i);
       /* tighten variable bounds*/
@@ -1893,7 +1897,7 @@ DGG_add2stepToList ( DGG_constraint_t *base, char *isint, double * /*x*/,
   bht = ABOV(base->rhs);
 
   double best_rc = 0;
-  for(i=0; i<base->nz; i++) if (isint[i]) best_rc = CoinMax(best_rc, fabs(rc[i]));
+  for(i=0; i<base->nz; i++) if (isint[i]) best_rc = std::max(best_rc, fabs(rc[i]));
   double  rc_cutoff = best_rc / 10;
 
   for(i=0; i<base->nz; i++){
@@ -1919,7 +1923,7 @@ DGG_add2stepToList ( DGG_constraint_t *base, char *isint, double * /*x*/,
     rc_val = COIN_DBL_MAX; // this gives a lower bound on obj. fn. improvement
 
     for(i=0; i<cut->nz; i++) if(cut->coeff[i]> 1E-6){
-      rc_val = CoinMin(rc_val, fabs(rc[i])/cut->coeff[i]);
+      rc_val = std::min(rc_val, fabs(rc[i])/cut->coeff[i]);
     }
     rc_val *= cut->rhs;
 
@@ -2175,11 +2179,6 @@ int DGG_is_even(double vht, double bht, int tau, int q)
   return 0;
 }
 
-double frac_part(double value) 
-{
-  return value-floor(value);
-}
-
 int DGG_is_a_multiple_of_b(double a, double b)
 {
   double c = b/a;
@@ -2255,6 +2254,8 @@ CglTwomir::refreshSolver(OsiSolverInterface * solver)
     delete originalSolver_;
     originalSolver_ = solver->clone();
   }
+  // Get integer information
+  solver->getColType(true);
 }
 // Create C++ lines to get to current state
 std::string

@@ -262,18 +262,18 @@ void CglRedSplit::find_step(int r1, int r2, int *step,
    double btb_val = rs_dotProd(contNonBasicTab[r1], contNonBasicTab[r2], nTab);
    double opt_step = btb_val/norm[r2];
 
-   int f_step= static_cast<int> (floor(opt_step));
-   int c_step = f_step + 1;
+   double f_step= floor(opt_step);
+   double c_step = f_step + 1;
 
    double val_f = norm[r1] + f_step * f_step * norm[r2] - 2 * btb_val * f_step;
    double val_c = norm[r1] + c_step * c_step * norm[r2] - 2 * btb_val * c_step;
 
    if(val_f <= val_c ) {
-     (*step) = f_step;
+     (*step) = static_cast<int>(f_step);
      (*reduc) = norm[r1] - val_f;
    }
    else {
-     (*step) = c_step;
+     (*step) = static_cast<int>(c_step);
      (*reduc) = norm[r1] - val_c;
    }
 } /* find_step */
@@ -620,19 +620,19 @@ double CglRedSplit::row_scale_factor(double *row) {
 
   for(i=0; i<ncol; i++) {
     val = fabs(row[i]);
-    max_val = CoinMax(max_val, val);
+    max_val = std::max(max_val, val);
     norm += val * val;
 
     if(low_is_lub[i] + up_is_lub[i]) {
       if(val > param.getEPS_COEFF_LUB()) {
-	min_val = CoinMin(min_val, val);
+	min_val = std::min(min_val, val);
 	has_lub = 1;
 	nelem++;
       }
     }
     else {
       if(val > param.getEPS_COEFF()) {
-	min_val = CoinMin(min_val, val);
+	min_val = std::min(min_val, val);
 	nelem++;
      }
     }
@@ -1355,7 +1355,7 @@ void CglRedSplit::generateCuts(OsiCuts &cs)
     return; // no cuts can be generated
   }
 
-  /* Loop is mTab * mTab * CoinMax(mTab, nTab) so may be very expensive. 
+  /* Loop is mTab * mTab * std::max(mTab, nTab) so may be very expensive. 
      Reduce mTab if the above value is larger than maxTab_ */
 
   int new_mTab = card_intBasicVar_frac;
@@ -1639,7 +1639,6 @@ void CglRedSplit::compute_is_lub() {
 void CglRedSplit::compute_is_integer() {
 
   int i;
-
   if(colType != NULL) {
     for(i=0; i<ncol; i++) {
       if(colType[i] != 'C') {
@@ -1659,8 +1658,9 @@ void CglRedSplit::compute_is_integer() {
     }
   }
   else {
+    const char * intVar = solver->getColType();
     for(i=0; i<ncol; i++) {
-      if(solver->isInteger(i)) {
+      if(intVar[i]) {
 	is_integer[i] = 1;
       }
       else {

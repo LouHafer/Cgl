@@ -34,15 +34,20 @@ CglMixedIntegerRounding2::generateCuts(const OsiSolverInterface& si,
   // everytime this function is called. Otherwise, just do once.
   bool preInit = false;
   bool preReso = false;
+  info_ = &info;
   si.getHintParam(OsiDoPresolveInInitial, preInit);
   si.getHintParam(OsiDoPresolveInResolve, preReso);
   // Deal with MAXAGGR_
   int saveMaxAggr = MAXAGGR_;
-  if (MAXAGGR_==-1) {
-    if(!info.inTree && info.pass<1000)
+  if (MAXAGGR_<0) {
+    if(!info.inTree && info.pass<1000) {
       MAXAGGR_=5; // up at root
-    else
-      MAXAGGR_=1;
+    } else {
+      if (MAXAGGR_==-1)
+	MAXAGGR_=1;
+      else
+	return;
+    }
   }
   if (preInit == false &&  preReso == false && doPreproc_ == -1 ) { // Do once
     if (doneInitPre_ == false) {   
@@ -63,6 +68,7 @@ CglMixedIntegerRounding2::generateCuts(const OsiSolverInterface& si,
     }
   }
   int numberColumns = si.getNumCols();
+  const char * intVar = si.getColType();
 #ifdef CBC_HAS_CLP
 #define MODIFY_LP 2
 #endif
@@ -82,7 +88,7 @@ CglMixedIntegerRounding2::generateCuts(const OsiSolverInterface& si,
       for (int i=0;i<numberColumns;i++) {
 	if (obj[i]) {
 	  nVar++;
-	  if (!si.isInteger(i))
+	  if (!intVar[i])
 	    nContVar++;
 	}
       }
@@ -291,7 +297,7 @@ CglMixedIntegerRounding2::gutsOfConstruct (const int maxaggr,
     MAXAGGR_ = maxaggr;
   }
   else {
-    throw CoinError("Unallowable value. maxaggr must be > 0",
+    throw CoinError("Unallowable value. maxaggr must not be 0",
                       "gutsOfConstruct","CglMixedIntegerRounding2");
   }
   MULTIPLY_ = multiply;
@@ -461,14 +467,8 @@ mixIntRoundPreprocess(const OsiSolverInterface& si)
   // Save integer type for speed
   if (integerType_) 
     delete [] integerType_;
-  integerType_ = new char [numCols_];
+  integerType_ = CoinCopyOfArray(si.getColType(),numCols_);
   int iColumn;
-  for (iColumn=0;iColumn<numCols_;iColumn++) {
-    if (si.isInteger(iColumn))
-      integerType_[iColumn]=1;
-    else
-      integerType_[iColumn]=0;
-  }
 
   if (rowTypes_ != 0) {
     delete [] rowTypes_; rowTypes_ = 0;
@@ -993,6 +993,14 @@ CglMixedIntegerRounding2::generateMirCuts(
 	    hasCut = false;
 	}
 #endif
+#if 1
+	if (info_->pass || info_->inTree) {
+	  const CoinPackedVector & row = cMirCut.row();
+	  int n=row.getNumElements();
+	  if (n>0.8*numCols_)
+	    hasCut = false;
+	}
+#endif
 	if (hasCut)  {
 	  // look at cut to see if unstable
 	  const CoinPackedVector & row = cMirCut.row();
@@ -1000,14 +1008,25 @@ CglMixedIntegerRounding2::generateMirCuts(
 	  const double * elements = row.getElements();
 	  double largest = 0.0;
 	  double smallest = COIN_DBL_MAX;
+	  const int * columns = row.getIndices();
+	  //const double* xlp        = si.getColSolution();  // LP solution
+	  double total=0.0;
 	  for (int i=0;i<n;i++) {
-	    double value = fabs(elements[i]);
-	    largest=CoinMax(largest,value);
-	    smallest=CoinMin(smallest,value);
+	    double value = elements[i];
+	    int jColumn =columns[i];
+	    total += value*xlp[jColumn];
+	    value = fabs(value);
+	    largest=std::max(largest,value);
+	    smallest=std::min(smallest,value);
 	  }
 	  if (largest>1.0e8*smallest||largest>1.0e7||smallest<1.0e-5) {
 #if CGL_DEBUG
-	    printf("Unstable Mixed cut %g <= ",cMirCut.lb());
+	    printf("Unstable Mixed cut %g <= ",cMirCut.ub());
+#endif
+	  } else if (total<cMirCut.ub()+1.0e-6) {
+	    assert (cMirCut.lb()<-1.0e20);
+#if CGL_DEBUG
+	    printf("Useless Mixed cut %g <= ",cMirCut.ub());
 #endif
 	  } else {
 #if CGL_DEBUG
@@ -1017,7 +1036,7 @@ CglMixedIntegerRounding2::generateMirCuts(
 	      printf("(%d,%g) ",columns[i],elements[i]);
 	    printf("<= %g\n",cMirCut.ub());
 #endif
-	    cs.insertIfNotDuplicate(cMirCut,tolTest);
+	    cs.insertIfNotDuplicateAndClean(cMirCut,31,tolTest);
 	  }
 	}
 
@@ -1138,7 +1157,7 @@ CglMixedIntegerRounding2::selectRowToAggregate(
                       VUB.getVal() * xlp[VUB.getVar()] : colUpperBound[indCol];
 
     // Compute distances from current solution to upper and lower bounds
-    double delta = CoinMin(xlp[indCol] - LB, UB - xlp[indCol]);
+    double delta = std::min(xlp[indCol] - LB, UB - xlp[indCol]);
 
     // In case this variable is acceptable look for possible rows
     if (delta > deltaMax) {
@@ -1644,9 +1663,9 @@ CglMixedIntegerRounding2::cMirSeparation(
   for ( j = 0; j < cutLen; ++j) {
     int column = cutInd[j];
     double value = cutCoef[column];
-    largest=CoinMax(largest,fabs(value));
+    largest=std::max(largest,fabs(value));
   }
-  double testValue=CoinMax(1.0e-6*largest,1.0e-12);
+  double testValue=std::max(1.0e-6*largest,1.0e-12);
   int n=0;
   for ( j = 0; j < cutLen; ++j) {
     int column = cutInd[j];
@@ -1909,6 +1928,8 @@ void
 CglMixedIntegerRounding2::refreshSolver(OsiSolverInterface * solver)
 {
   if (solver->getNumRows()) {
+    // Get integer information
+    solver->getColType(true);
     mixIntRoundPreprocess(*solver);
     doneInitPre_ = true;
   } else {
