@@ -46,6 +46,7 @@ CglZeroHalf::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
       }
     }
     if (true) {
+    cutInfo_.setMaxSeconds(getMaxSeconds());
     cutInfo_.sep_012_cut(mr_,mc_,mnz_,
 				 mtbeg_,mtcnt_, mtind_, mtval_,
 				 vlb_, vub_,
@@ -121,7 +122,7 @@ CglZeroHalf::generateCuts(const OsiSolverInterface & si, OsiCuts & cs,
 	  rc.setGloballyValid();
 	//double violation = rc.violated(solution);
 	//if (violation>1.0e-6)
-	  cs.insertIfNotDuplicate(rc);
+	cs.insertIfNotDuplicate(rc);
 	  //else
 	  //printf("violation of %g\n",violation);
       }
@@ -189,6 +190,9 @@ CglZeroHalf::CglZeroHalf (
   }
   //cutInfo_ = Cgl012Cut(source.cutInfo_);
   cutInfo_ = Cgl012Cut();
+  cutInfo_.setSepGraphSparseThreshold(source.cutInfo_.getSepGraphSparseThreshold());
+  cutInfo_.setRowMaxPairCount(source.cutInfo_.getRowMaxPairCount());
+  cutInfo_.setRowMaxFractionalCount(source.cutInfo_.getRowMaxFractionalCount());
 }
 
 
@@ -258,6 +262,9 @@ CglZeroHalf::operator=(
     }
     //cutInfo_=Cgl012Cut(rhs.cutInfo_);
     cutInfo_=Cgl012Cut();
+    cutInfo_.setSepGraphSparseThreshold(rhs.cutInfo_.getSepGraphSparseThreshold());
+    cutInfo_.setRowMaxPairCount(rhs.cutInfo_.getRowMaxPairCount());
+    cutInfo_.setRowMaxFractionalCount(rhs.cutInfo_.getRowMaxFractionalCount());
   }
   return *this;
 }
@@ -501,6 +508,12 @@ CglZeroHalf::generateCpp( FILE * fp)
     fprintf(fp,"3  zeroHalf.setAggressiveness(%d);\n",getAggressiveness());
   else
     fprintf(fp,"4  zeroHalf.setAggressiveness(%d);\n",getAggressiveness());
+  if (getSepGraphSparseThreshold()!=other.getSepGraphSparseThreshold())
+    fprintf(fp,"3  zeroHalf.setSepGraphSparseThreshold(%d);\n",getSepGraphSparseThreshold());
+  if (getRowMaxPairCount()!=other.getRowMaxPairCount())
+    fprintf(fp,"3  zeroHalf.setRowMaxPairCount(%d);\n",getRowMaxPairCount());
+  if (getRowMaxFractionalCount()!=other.getRowMaxFractionalCount())
+    fprintf(fp,"3  zeroHalf.setRowMaxFractionalCount(%d);\n",getRowMaxFractionalCount());
   return "zeroHalf";
 }
 #include <vector>
@@ -545,6 +558,9 @@ void cglShortestPath(auxiliary_graph * graph, int source, int maximumLength)
   std::pop_heap(nodes_.begin(), nodes_.end(), best);
   nodes_.pop_back();
   if (nodes[iNode].distanceBack==COIN_INT_MAX)
+    break;
+  // Prune: no useful odd cycle can have weight > maximumLength
+  if (nodes[iNode].distanceBack >= maximumLength)
     break;
   numberCandidates--;
 #else

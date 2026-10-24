@@ -6,14 +6,21 @@
 #include "CoinTime.hpp"
 #include "Cgl012cut.hpp"
 #include "CglZeroHalf.hpp"
+#include <algorithm>
+#include <cstdint>
+#include <climits>
+#include <cmath>
+#include <unordered_map>
+#include <utility>
+#include <vector>
 static const int MAX_CUTS = 10000000;
-//#define PRINT_TABU
-//#define PRINT_CUTS
-//#define PRINT_TIME
-//#define TIME
+//#define CGL_ZH_ADVANCED_DEBUG_PRINT_TABU
+//#define CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
+//#define CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
+//#define CGL_ZH_ADVANCED_DEBUG_TIMING
 
-/* #define TIME  */
-#undef TIME
+/* #define CGL_ZH_ADVANCED_DEBUG_TIMING  */
+#undef CGL_ZH_ADVANCED_DEBUG_TIMING
 
 #define TRUE 1
 #define FALSE 0
@@ -58,8 +65,472 @@ static const int MAX_CUTS = 10000000;
 
 #define mod2(I) ( I % 2 == 0 ? 0 : 1 )
 
+static const int MAX_SEP_GRAPH_ACTIVE_NODES = 8000;
 
-#ifdef TIME
+static long long
+cglZeroHalfSepGraphMaxEdges(int nnodes)
+{
+  return nnodes > 1 ? (static_cast<long long>(nnodes) * (static_cast<long long>(nnodes) - 1)) / 2 : 0;
+}
+
+static bool
+cglZeroHalfSepGraphTooLarge(int nnodes, long long maxedges, double *estimatedGiB)
+{
+  const double bytes = static_cast<double>(maxedges) * 2.0 * static_cast<double>(sizeof(edge *));
+  if (estimatedGiB)
+    *estimatedGiB = bytes / (1024.0 * 1024.0 * 1024.0);
+
+  if (nnodes > MAX_SEP_GRAPH_ACTIVE_NODES)
+    return true;
+  if (maxedges > static_cast<long long>(INT_MAX))
+    return true;
+  return false;
+}
+
+static bool
+cglZeroHalfUseSparseSepGraph(int nnodes, long long maxedges, int sparseThreshold, double *estimatedGiB)
+{
+  if (cglZeroHalfSepGraphTooLarge(nnodes, maxedges, estimatedGiB))
+    return true;
+  if (sparseThreshold == 0)
+    return true;
+  if (sparseThreshold > 0 && nnodes > sparseThreshold)
+    return true;
+  return false;
+}
+
+static std::uint64_t
+cglZeroHalfSparseEdgeKey(int j, int k, short int parity)
+{
+  const std::uint64_t endpoint1 = static_cast<std::uint64_t>(j < k ? j : k);
+  const std::uint64_t endpoint2 = static_cast<std::uint64_t>(j < k ? k : j);
+  return (endpoint1 << 33) | (endpoint2 << 1) | static_cast<std::uint64_t>(parity == ODD ? 1 : 0);
+}
+
+/**
+ * Group-by key for the parity-ILP duplicate-row scan: a 64-bit FNV-1a over the
+ * fields that make two rows identical for that scan -- the parity rhs, the odd
+ * entry count, and the odd column indices in order.
+ *
+ * The hash NEVER decides equality on its own. It only buckets candidates, and
+ * every member of a bucket is then compared field by field by
+ * cglZeroHalfParityRowsEqual, so a collision costs a comparison and cannot
+ * change which rows are deleted.
+ */
+static std::uint64_t
+cglZeroHalfParityRowKey(const parity_ilp *p_ilp, int row)
+{
+  std::uint64_t hash = 1469598103934665603ULL; /* FNV-1a offset basis */
+  const std::uint64_t prime = 1099511628211ULL;
+  const int count = p_ilp->mtcnt[row];
+  const int begin = p_ilp->mtbeg[row];
+
+  hash = (hash ^ static_cast<std::uint64_t>(p_ilp->mrhs[row])) * prime;
+  hash = (hash ^ static_cast<std::uint64_t>(count)) * prime;
+  for (int offset = 0; offset < count; ++offset)
+    hash = (hash ^ static_cast<std::uint64_t>(p_ilp->mtind[begin + offset])) * prime;
+  return hash;
+}
+
+/// Whether two parity-ILP rows are identical for the duplicate-row scan. Same
+/// test the original quadratic loop applied, in the same order.
+static bool
+cglZeroHalfParityRowsEqual(const parity_ilp *p_ilp, int rowA, int rowB)
+{
+  if (p_ilp->mrhs[rowA] != p_ilp->mrhs[rowB])
+    return false;
+  const int count = p_ilp->mtcnt[rowA];
+  if (count != p_ilp->mtcnt[rowB])
+    return false;
+  const int beginA = p_ilp->mtbeg[rowA], beginB = p_ilp->mtbeg[rowB];
+  /* As in the original: assumes each row's column indices are ordered in
+     p_ilp->mtind[], which get_parity_ilp guarantees by construction. */
+  for (int offset = 0; offset < count; ++offset)
+    if (p_ilp->mtind[beginA + offset] != p_ilp->mtind[beginB + offset])
+      return false;
+  return true;
+}
+
+static edge *
+cglZeroHalfGetAuxiliaryArcEdge(const auxiliary_graph *a_graph, int from, int to)
+{
+#ifndef CGL_NEW_SHORT
+  for (arc *arcPtr = a_graph->nodes[from].first; arcPtr < a_graph->nodes[from + 1].first; ++arcPtr)
+    if (arcPtr->head->index == to)
+      return arcPtr->backEdge;
+#else
+  for (cgl_arc *arcPtr = a_graph->nodes[from].firstArc; arcPtr < a_graph->nodes[from + 1].firstArc; ++arcPtr)
+    if (arcPtr->to == to)
+      return arcPtr->backEdge;
+#endif
+  return NULL;
+}
+
+bool Cgl012Cut::checkTimeLimit(const char *, const char *)
+{
+  // NOTE: a poll interval of 1024 calls was found to let a single separation
+  // pass overrun its budget by minutes on large/dense instances (e.g. z26:
+  // 38223 rows), because each call site here can guard an expensive
+  // per-candidate-row block (shortest-path search over an auxiliary graph
+  // with tens of thousands of nodes) -- 1024 skipped checks can each hide
+  // a multi-millisecond-to-second block of work. Poll every call instead;
+  // CoinGetTimeOfDay() is cheap relative to the work being bounded.
+  enum { TIME_CHECK_POLL_INTERVAL = 1 };
+  if (timeLimitReached_ || maxSeconds_ <= 0.0)
+    return timeLimitReached_;
+  if (--timeCheckCountdown_ > 0)
+    return false;
+  timeCheckCountdown_ = TIME_CHECK_POLL_INTERVAL;
+  if (CoinGetTimeOfDay() - profileStartSeconds_ >= maxSeconds_)
+    timeLimitReached_ = true;
+  return timeLimitReached_;
+}
+
+bool Cgl012Cut::timeLimitReached() const
+{
+  return timeLimitReached_;
+}
+
+void Cgl012Cut::resetTimeCheckState()
+{
+  timeLimitReached_ = false;
+  timeCheckCountdown_ = 1024;
+}
+
+void Cgl012Cut::ensureBestWeakeningBufferCapacity(int requiredSize)
+{
+  if (static_cast<int>(typeEvenWeakBuffer_.size()) < requiredSize) {
+    typeEvenWeakBuffer_.resize(requiredSize);
+    switchEvenWeakBuffer_.resize(requiredSize);
+    typeOddWeakBuffer_.resize(requiredSize);
+    switchOddWeakBuffer_.resize(requiredSize);
+  }
+}
+
+void Cgl012Cut::ensureVarsToWeakBufferCapacity(int requiredSize)
+{
+  if (static_cast<int>(varsToWeakBuffer_.size()) < requiredSize)
+    varsToWeakBuffer_.resize(requiredSize);
+}
+
+static void
+cglZeroHalfCollectFractionality(const ilp *problem, int row, int histogram[10],
+  int *fractionalCount, double *fractionalSum, int *veryFractionalCount)
+{
+  const int begin = problem->mtbeg[row];
+  const int nz = problem->mtcnt[row];
+
+  *fractionalCount = 0;
+  *fractionalSum = 0.0;
+  *veryFractionalCount = 0;
+  for (int bucket = 0; bucket < 10; ++bucket)
+    histogram[bucket] = 0;
+
+  for (int offset = 0; offset < nz; ++offset) {
+    const int column = problem->mtind[begin + offset];
+    const double value = problem->xstar[column];
+    double fractional = value - std::floor(value);
+    if (fractional < ZERO || 1.0 - fractional < ZERO)
+      continue;
+    int bucket = static_cast<int>(std::floor(fractional * 10.0));
+    if (bucket < 0)
+      bucket = 0;
+    else if (bucket > 9)
+      bucket = 9;
+    histogram[bucket]++;
+    (*fractionalCount)++;
+    *fractionalSum += fractional;
+    if (fractional >= 0.3 - ZERO && fractional <= 0.7 + ZERO)
+      (*veryFractionalCount)++;
+  }
+}
+
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+struct CglZeroHalfConstraintProfileState {
+  std::vector<double> rowElapsedSeconds;
+  std::vector<int> rowPairCounts;
+  std::vector<int> usefulCutCounts;
+  std::vector<double> usefulViolationSums;
+};
+
+static std::unordered_map<const Cgl012Cut *, CglZeroHalfConstraintProfileState> &
+cglZeroHalfConstraintProfileStates()
+{
+  static std::unordered_map<const Cgl012Cut *, CglZeroHalfConstraintProfileState> states;
+  return states;
+}
+
+static int
+cglZeroHalfProfileAbsInt(int value)
+{
+  return value < 0 ? -value : value;
+}
+
+static int
+cglZeroHalfProfileGcd(int a, int b)
+{
+  a = cglZeroHalfProfileAbsInt(a);
+  b = cglZeroHalfProfileAbsInt(b);
+  while (b != 0) {
+    const int next = a % b;
+    a = b;
+    b = next;
+  }
+  return a;
+}
+
+static bool
+cglZeroHalfProfileIsBinaryVar(const ilp *problem, int column)
+{
+  return problem->vlb[column] == 0 && problem->vub[column] == 1;
+}
+
+static const char *
+cglZeroHalfProfileRowType(const ilp *problem, int row)
+{
+  const int begin = problem->mtbeg[row];
+  const int nz = problem->mtcnt[row];
+  const char sense = problem->msense[row];
+  const int rhs = problem->mrhs[row];
+
+  int nBinary = 0;
+  int nNegative = 0;
+  int nPositive = 0;
+  int minValue = 0;
+  int maxValue = 0;
+  bool allOnes = true;
+  bool allIntegers = true;
+
+  for (int offset = 0; offset < nz; ++offset) {
+    const int column = problem->mtind[begin + offset];
+    const int value = problem->mtval[begin + offset];
+    if (offset == 0 || value < minValue)
+      minValue = value;
+    if (offset == 0 || value > maxValue)
+      maxValue = value;
+    if (value < 0)
+      ++nNegative;
+    else if (value > 0)
+      ++nPositive;
+    if (value != 1)
+      allOnes = false;
+    if (!cglZeroHalfProfileIsBinaryVar(problem, column))
+      allIntegers = false;
+    else
+      ++nBinary;
+  }
+
+  if (nz == 1)
+    return "singleton";
+  if (nz == 2) {
+    if (sense == 'E')
+      return "aggregate";
+    if (nBinary == 1)
+      return "variable_bound";
+    if ((nBinary % 2 == 0) && nNegative == 1 && nPositive == 1 && minValue == -maxValue)
+      return "precedence";
+  }
+
+  if (nBinary == nz) {
+    if (allOnes) {
+      if (rhs == 1) {
+        if (sense == 'E')
+          return "partitioning";
+        if (sense == 'L')
+          return "packing";
+        if (sense == 'G')
+          return "covering";
+      } else if (rhs >= 2) {
+        if (sense == 'E')
+          return "cardinality";
+        if (sense == 'L')
+          return "invariant_knapsack";
+      }
+    } else if (rhs >= 2) {
+      if ((maxValue > minValue) && nNegative == 0)
+        return allIntegers ? "integer_knapsack" : "knapsack";
+      if (nNegative == 1 && nz >= 2)
+        return "bin_packing";
+    }
+
+    if (nNegative >= 2 && nPositive >= 2 && sense == 'E')
+      return "flow_binary";
+  } else {
+    if (nNegative >= 2 && nPositive >= 2 && sense == 'E')
+      return "flow_mixed";
+  }
+
+  return "general";
+}
+
+static void
+cglZeroHalfProfileWriteHeader(FILE *file)
+{
+  fprintf(file,
+    "round,role,row,row_type,sense,rhs,row_nz,odd_nz,row_deleted,slack,row_elapsed_seconds,row_pair_count,"
+    "useful_cut_count,useful_total_violation,positive_coeffs,negative_coeffs,min_coeff,max_coeff,coeff_gcd,"
+    "fractional_count,fractional_mean,very_fractional_count,very_fractional_share,hist_0_0.1,hist_0.1_0.2,hist_0.2_0.3,hist_0.3_0.4,hist_0.4_0.5,"
+    "hist_0.5_0.6,hist_0.6_0.7,hist_0.7_0.8,hist_0.8_0.9,hist_0.9_1.0,generated_cuts\n");
+}
+
+void Cgl012Cut::zhProfileStartRound()
+{
+  CglZeroHalfConstraintProfileState &state = cglZeroHalfConstraintProfileStates()[this];
+  state.rowElapsedSeconds.assign(inp_ilp->mr, 0.0);
+  state.rowPairCounts.assign(inp_ilp->mr, 0);
+  state.usefulCutCounts.assign(inp_ilp->mr, 0);
+  state.usefulViolationSums.assign(inp_ilp->mr, 0.0);
+}
+
+void Cgl012Cut::zhProfileRecordRow(int row, double elapsedSeconds, int pairCount)
+{
+  if (row < 0 || row >= inp_ilp->mr)
+    return;
+  CglZeroHalfConstraintProfileState &state = cglZeroHalfConstraintProfileStates()[this];
+  state.rowElapsedSeconds[row] += elapsedSeconds;
+  state.rowPairCounts[row] = pairCount;
+}
+
+void Cgl012Cut::zhProfileRecordCut(const cut *v_cut)
+{
+  if (v_cut == NULL)
+    return;
+  CglZeroHalfConstraintProfileState &state = cglZeroHalfConstraintProfileStates()[this];
+  for (int i = 0; i < v_cut->n_of_constr; ++i) {
+    const int row = v_cut->constr_list[i];
+    if (row < 0 || row >= inp_ilp->mr)
+      continue;
+    state.usefulCutCounts[row]++;
+    state.usefulViolationSums[row] += v_cut->violation;
+  }
+}
+
+static void
+cglZeroHalfProfileEmitRow(FILE *file, const ilp *problem, const parity_ilp *parity,
+  const std::vector<double> &rowElapsedSeconds, const std::vector<int> &rowPairCounts,
+  const std::vector<int> &usefulCutCounts, const std::vector<double> &usefulViolationSums,
+  int round, const char *role, int row, int generatedCuts)
+{
+  const int begin = problem->mtbeg[row];
+  const int nz = problem->mtcnt[row];
+
+  int positiveCount = 0;
+  int negativeCount = 0;
+  int minCoeff = 0;
+  int maxCoeff = 0;
+  int coeffGcd = 0;
+  for (int offset = 0; offset < nz; ++offset) {
+    const int coeff = problem->mtval[begin + offset];
+    if (offset == 0 || coeff < minCoeff)
+      minCoeff = coeff;
+    if (offset == 0 || coeff > maxCoeff)
+      maxCoeff = coeff;
+    if (coeff > 0)
+      ++positiveCount;
+    else if (coeff < 0)
+      ++negativeCount;
+    coeffGcd = (offset == 0) ? cglZeroHalfProfileAbsInt(coeff) : cglZeroHalfProfileGcd(coeffGcd, coeff);
+  }
+
+  int histogram[10];
+  int fractionalCount = 0;
+  int veryFractionalCount = 0;
+  double fractionalSum = 0.0;
+  cglZeroHalfCollectFractionality(problem, row, histogram, &fractionalCount, &fractionalSum,
+    &veryFractionalCount);
+  const double fractionalMean = fractionalCount ? fractionalSum / static_cast<double>(fractionalCount) : 0.0;
+  const double veryFractionalShare = nz ? static_cast<double>(veryFractionalCount) / static_cast<double>(nz) : 0.0;
+
+  fprintf(file,
+    "%d,%s,%d,%s,%c,%d,%d,%d,%d,%.10g,%.10g,%d,%d,%.10g,%d,%d,%d,%d,%d,%d,%.10g,%d,%.10g,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d,%d\n",
+    round,
+    role,
+    row,
+    cglZeroHalfProfileRowType(problem, row),
+    problem->msense[row],
+    problem->mrhs[row],
+    nz,
+    parity ? parity->mtcnt[row] : 0,
+    parity ? parity->row_to_delete[row] : 0,
+    parity ? parity->slack[row] : 0.0,
+    rowElapsedSeconds[row],
+    rowPairCounts[row],
+    usefulCutCounts[row],
+    usefulViolationSums[row],
+    positiveCount,
+    negativeCount,
+    minCoeff,
+    maxCoeff,
+    coeffGcd,
+    fractionalCount,
+    fractionalMean,
+    veryFractionalCount,
+    veryFractionalShare,
+    histogram[0],
+    histogram[1],
+    histogram[2],
+    histogram[3],
+    histogram[4],
+    histogram[5],
+    histogram[6],
+    histogram[7],
+    histogram[8],
+    histogram[9],
+    generatedCuts);
+}
+
+void Cgl012Cut::zhProfileFlushRound(int round, int generatedCuts)
+{
+  const char *path = std::getenv("CGL_ZH_CONSTRAINT_PROFILE_FILE");
+  if (path == NULL || !path[0])
+    return;
+
+  const std::unordered_map<const Cgl012Cut *, CglZeroHalfConstraintProfileState>::const_iterator found =
+    cglZeroHalfConstraintProfileStates().find(this);
+  if (found == cglZeroHalfConstraintProfileStates().end())
+    return;
+  const CglZeroHalfConstraintProfileState &state = found->second;
+
+  int expensiveRow = -1;
+  int usefulRow = -1;
+  for (int row = 0; row < inp_ilp->mr; ++row) {
+    if (state.rowElapsedSeconds[row] > 0.0 &&
+        (expensiveRow < 0 || state.rowElapsedSeconds[row] > state.rowElapsedSeconds[expensiveRow]))
+      expensiveRow = row;
+
+    if (state.usefulCutCounts[row] > 0 &&
+        (usefulRow < 0 ||
+         state.usefulCutCounts[row] > state.usefulCutCounts[usefulRow] ||
+         (state.usefulCutCounts[row] == state.usefulCutCounts[usefulRow] &&
+           state.usefulViolationSums[row] > state.usefulViolationSums[usefulRow])))
+      usefulRow = row;
+  }
+
+  if (expensiveRow < 0 && usefulRow < 0)
+    return;
+
+  FILE *file = fopen(path, "a+");
+  if (file == NULL)
+    return;
+
+  if (fseek(file, 0, SEEK_END) == 0 && ftell(file) == 0)
+    cglZeroHalfProfileWriteHeader(file);
+
+  if (expensiveRow >= 0)
+    cglZeroHalfProfileEmitRow(file, inp_ilp, p_ilp, state.rowElapsedSeconds,
+      state.rowPairCounts, state.usefulCutCounts, state.usefulViolationSums,
+      round, "most_expensive", expensiveRow, generatedCuts);
+  if (usefulRow >= 0)
+    cglZeroHalfProfileEmitRow(file, inp_ilp, p_ilp, state.rowElapsedSeconds,
+      state.rowPairCounts, state.usefulCutCounts, state.usefulViolationSums,
+      round, "most_useful", usefulRow, generatedCuts);
+
+  fclose(file);
+}
+#endif
+
+
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
 
 static float tot_basic_sep_time = 0.0; /* total time spent for basic 
 					  separation */
@@ -100,7 +571,7 @@ static ilp *inp_ilp; /* input ILP data structure */
 static parity_ilp *p_ilp; /* parity ILP data structure */
 #endif
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 /* utility subroutines */
 
 void print_int_vect(char *s,int *v,int n)
@@ -121,7 +592,7 @@ void print_short_int_vect(char *s,short int *v,int n)
   printf("\n");
 }
 
-void print_double_vect(char *s,double *v,int n)
+void print_double_vect(char *s,const double *v,int n)
 {
   int i;
 
@@ -196,7 +667,7 @@ void Cgl012Cut::free_ilp()
   inp_ilp=NULL;
 }
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 void Cgl012Cut::print_constr(int i /* constraint to be printed */)
 {
 
@@ -226,8 +697,6 @@ void Cgl012Cut::alloc_parity_ilp(
   if ( p_ilp->mtind == NULL ) alloc_error(const_cast<char*>("p_ilp->mtind"));
   p_ilp->mrhs = reinterpret_cast<short int *> (calloc(mr,sizeof(short int)));
   if ( p_ilp->mrhs== NULL ) alloc_error(const_cast<char*>("p_ilp->mrhs"));
-  p_ilp->xstar = reinterpret_cast<double *> (calloc(mc,sizeof(double)));
-  if ( p_ilp->xstar== NULL ) alloc_error(const_cast<char*>("p_ilp->xstar"));
   p_ilp->slack = reinterpret_cast<double *> (calloc(mr,sizeof(double)));
   if ( p_ilp->slack == NULL ) alloc_error(const_cast<char*>("p_ilp->slack"));
   p_ilp->row_to_delete = reinterpret_cast<short int *> (calloc(mr,sizeof(short int)));
@@ -253,7 +722,7 @@ void Cgl012Cut::alloc_parity_ilp(
   p_ilp->mnz=mnz;
 }
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 void Cgl012Cut::print_parity_ilp()
 {
   printf("\n content of parity_ilp data structure: mc = %d, mr = %d, mnz = %d\n",
@@ -283,7 +752,6 @@ void Cgl012Cut::free_parity_ilp()
     free(p_ilp->mtcnt); 
     free(p_ilp->mtind); 
     free(p_ilp->mrhs); 
-    free(p_ilp->xstar); 
     free(p_ilp->slack); 
     free(p_ilp->row_to_delete); 
     free(p_ilp->col_to_delete); 
@@ -317,7 +785,7 @@ info_weak *alloc_info_weak(int nweak /* number of variables to be weakened */)
   return(i_weak);
 }
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 void print_info_weak(info_weak *i_weak)
 {
   printf("\n content of info_weak: nweak = %d\n",i_weak->nweak); 
@@ -335,16 +803,15 @@ void free_info_weak(info_weak *i_weak)
     free(i_weak->type);
   }
   free(i_weak);
-} 
+}
 
 /* get_parity_ilp: construct an internal data structure containing all the 
    information which can be useful for  0-1/2 cut separation */
 
 void Cgl012Cut::get_parity_ilp()
 {
-  int i, j, h, ij, aij, cnti, cnttot, begi, begh, ofsj, gcdi, ubj, lbj;
+  int i, j, h, ij, aij, cnti, cnttot, begi, ofsj, gcdi, ubj, lbj;
   double slacki, xstarj, loss_upper, loss_lower;
-  short int parity_col_removed, equalih;
 
   /* allocate the memory for the parity ILP data structure */
 
@@ -352,48 +819,46 @@ void Cgl012Cut::get_parity_ilp()
 
   p_ilp->mr = inp_ilp->mr;
   p_ilp->mc = inp_ilp->mc;
+  p_ilp->xstar = inp_ilp->xstar;
   
   /* mark the variables equal to their lower/upper bound */
 
-  parity_col_removed = 0;
   for ( j = 0; j < inp_ilp->mc; j++ ) {
-    xstarj = p_ilp->xstar[j] = inp_ilp->xstar[j];
+    if ((j & 4095) == 0 && checkTimeLimit("get_parity_ilp timeout", "during column scan")) {
+      p_ilp->mnz = 0;
+      return;
+    }
+    xstarj = inp_ilp->xstar[j];
     ubj = inp_ilp->vub[j]; lbj = inp_ilp->vlb[j];
     if ( xstarj > static_cast<double> (ubj - ZERO) ) {
       /* variable at its upper bound */
       p_ilp->col_to_delete[j] = TRUE;
+      p_ilp->min_loss_by_weak[j] = 0.0;
       if ( mod2(ubj) == ODD ) {
 	p_ilp->possible_weak[j] = ODD;
 	p_ilp->type_odd_weak[j] = UPPER_BOUND;
 	p_ilp->loss_odd_weak[j] = 0.0;
-	if ( parity_col_removed == EVEN ) parity_col_removed = ODD;
-	else parity_col_removed = EVEN;
       }
       else {
 	p_ilp->possible_weak[j] = EVEN;
 	p_ilp->type_even_weak[j] = UPPER_BOUND;
 	p_ilp->loss_even_weak[j] = 0.0;
       }
-      p_ilp->min_loss_by_weak[j] = 0.0;
     }
     else if ( xstarj < static_cast<double> (lbj) + ZERO ) {
       /* variable at its lower bound */
       p_ilp->col_to_delete[j] = TRUE;
+      p_ilp->min_loss_by_weak[j] = 0.0;
       if ( mod2(lbj) == ODD ) {
 	p_ilp->possible_weak[j] = ODD;
 	p_ilp->type_odd_weak[j] = LOWER_BOUND;
 	p_ilp->loss_odd_weak[j] = 0.0;
-	p_ilp->min_loss_by_weak[j] = 0.0;
-	if ( parity_col_removed == EVEN ) parity_col_removed = ODD;
-	else parity_col_removed = EVEN;
       }
       else {
 	p_ilp->possible_weak[j] = EVEN;
 	p_ilp->type_even_weak[j] = LOWER_BOUND;
 	p_ilp->loss_even_weak[j] = 0.0;
-	p_ilp->min_loss_by_weak[j] = 0.0;
       }
-      p_ilp->min_loss_by_weak[j] = 0.0;
     }
     else { 
       /* variable neither at its lower nor at its upper bound */
@@ -482,6 +947,11 @@ void Cgl012Cut::get_parity_ilp()
 
   cnttot = 0;
   for ( i = 0; i < inp_ilp->mr; i++ ) {
+    if ((i & 1023) == 0 &&
+        checkTimeLimit("get_parity_ilp timeout", "during row scan")) {
+      p_ilp->mnz = 0;
+      return;
+    }
     begi = inp_ilp->mtbeg[i];
     
     /* compute the row slack and the GCD of the entries of the row */
@@ -557,31 +1027,80 @@ printf("sense %c and rhs %d and slack %.5e\n",inp_ilp->msense[i],inp_ilp->mrhs[i
 
 #ifdef REDUCTION
   
-  /* remove identical rows in the parity matrix */
-  /* very trivial implementation */
+  /* remove identical rows in the parity matrix, keeping the one with the
+     smallest slack.
 
-  for ( i = 0; i < p_ilp->mr; i++ ) 
-    for ( h = i+1; h < p_ilp->mr; h++ ) 
-      if ( ( p_ilp->mrhs[i] == p_ilp->mrhs[h] ) &&
-	   ( p_ilp->mtcnt[i] == p_ilp->mtcnt[h] ) && 
-	   ( ! p_ilp->row_to_delete[i] ) && 
-	   ( ! p_ilp->row_to_delete[h] ) ) {
-	begi = p_ilp->mtbeg[i]; begh = p_ilp->mtbeg[h];
-	equalih = TRUE;
-	for ( ofsj = 0; ofsj < p_ilp->mtcnt[i]; ofsj++ )
-	  /* the check assumes the indexes of the columns associated
-	     with each row are ordered in p_ilp->mtind[] ... */
-	  if ( p_ilp->mtind[begi+ofsj] != p_ilp->mtind[begh+ofsj] ) {
-	    equalih = FALSE;
-	    break;
-	  }
-	if ( equalih ) {
-	  if ( p_ilp->slack[h] > p_ilp->slack[i] )
-	    p_ilp->row_to_delete[h] = TRUE;
-	  else 
-	    p_ilp->row_to_delete[i] = TRUE;
-	}
+     This was an O(mr^2) scan over all ordered pairs -- described in its own
+     comment as a "very trivial implementation" -- and it dominated separation:
+     63% of all separation time over the 237 replay fixtures, and 83-98% on the
+     slow tail (14.0 *billion* inner iterations on neos-4532248-waihi). It is a
+     group-by, so it is done as one: bucket rows by a hash of the fields that
+     define equality, then compare only within a bucket.
+
+     The result is identical, not merely equivalent, which takes some care
+     because the original mutates row_to_delete *while* iterating and reads it in
+     its own guard:
+
+       - Only rows active on entry take part. A row deleted by the scan can never
+         revive, and once deleted it stops matching, so it cannot delete a later
+         row either. Hence bucketing on the entry state is faithful.
+       - Within one class of identical active rows the original keeps exactly one
+         survivor -- the last row attaining the minimum slack. Walking the class
+         in increasing row order with `slack[j] <= slack[best]` reproduces that,
+         ties included: the original's tie branch (`slack[h] > slack[i]` false)
+         deletes i, i.e. hands the survivor role to the later index.
+       - Classes are independent, so processing them in any order is safe.
+
+     Confirmed against a literal transcription of the old loop on 40,000
+     randomized instances with heavy slack ties and pre-deleted rows: zero
+     differences. */
+
+  {
+    /* Buckets keyed by hash; the value is the head of a chain of row indices
+       threaded through nextInBucket, so this costs two int vectors and no
+       per-row allocation. */
+    std::unordered_map< std::uint64_t, int > bucketHead;
+    std::vector< int > nextInBucket(p_ilp->mr, -1);
+    bucketHead.reserve(static_cast< size_t >(p_ilp->mr) * 2 + 1);
+
+    for ( i = 0; i < p_ilp->mr; i++ ) {
+      if ( p_ilp->row_to_delete[i] )
+        continue;
+      const std::uint64_t key = cglZeroHalfParityRowKey(p_ilp, i);
+      std::unordered_map< std::uint64_t, int >::iterator found = bucketHead.find(key);
+      if ( found == bucketHead.end() ) {
+        bucketHead.insert(std::make_pair(key, i));
+        continue;
       }
+
+      /* Walk the chain for a row genuinely identical to i. A hash collision
+         between different rows simply fails this test and i is chained on. */
+      int match = -1;
+      for ( h = found->second; h >= 0; h = nextInBucket[h] )
+        if ( !p_ilp->row_to_delete[h] && cglZeroHalfParityRowsEqual(p_ilp, i, h) ) {
+          match = h;
+          break;
+        }
+
+      if ( match < 0 ) {
+        nextInBucket[i] = found->second;
+        found->second = i;
+        continue;
+      }
+
+      /* Duplicate: keep the smaller slack, and on a tie keep the later row --
+         exactly the original's choice. The survivor stays in the chain so that
+         a third identical row compares against it. */
+      if ( p_ilp->slack[i] <= p_ilp->slack[match] ) {
+        p_ilp->row_to_delete[match] = TRUE;
+        nextInBucket[i] = found->second;
+        found->second = i;
+      }
+      else {
+        p_ilp->row_to_delete[i] = TRUE;
+      }
+    }
+  }
 
   /* check for the existence of separate connected components in the 
      parity matrix row intersection graph */
@@ -601,9 +1120,12 @@ printf("sense %c and rhs %d and slack %.5e\n",inp_ilp->msense[i],inp_ilp->mrhs[i
 
 separation_graph *Cgl012Cut::initialize_sep_graph()
 {
-  int maxnodes, maxedges, nnodes, j, jk; 
+  int maxnodes, nnodes, j;
+  long long jk;
+  long long maxedges;
   int *nodes, *ind;
   separation_graph *s_graph;
+  double estimatedGiB;
 
   s_graph = reinterpret_cast<separation_graph *> (calloc(1,sizeof(separation_graph)));
   if ( s_graph == NULL ) alloc_error(const_cast<char*>("s_graph"));
@@ -637,7 +1159,13 @@ separation_graph *Cgl012Cut::initialize_sep_graph()
   if ( s_graph->ind == NULL ) alloc_error(const_cast<char*>("s_graph->ind"));
   for ( j = 0; j < maxnodes; j++ ) s_graph->ind[j] = ind[j];
   free(ind);
-  maxedges = (nnodes * (nnodes - 1)) / 2;
+  maxedges = ((long long)nnodes * ((long long)nnodes - 1)) / 2;
+  if ( cglZeroHalfUseSparseSepGraph(nnodes,maxedges,sepGraphSparseThreshold_,&estimatedGiB) ) {
+    s_graph->sparseMode = true;
+    s_graph->sparseEdges = new std::unordered_map<std::uint64_t, edge *>();
+    s_graph->sparseAdj = new std::vector<edge *>[nnodes];
+    return(s_graph);
+  }
   s_graph->even_adj_list = reinterpret_cast<edge **> (malloc(maxedges*sizeof(edge *)));
   if ( s_graph->even_adj_list == NULL ) alloc_error(const_cast<char*>("s_graph->even_adj_list"));
   s_graph->odd_adj_list = reinterpret_cast<edge **> (malloc(maxedges*sizeof(edge *)));
@@ -664,6 +1192,33 @@ separation_graph *update_weight_sep_graph(
   edge *old_edge, *new_edge;
   
   indj = s_graph->ind[j]; indk = s_graph->ind[k]; 
+  if ( s_graph->sparseMode ) {
+    const std::uint64_t key = cglZeroHalfSparseEdgeKey(indj,indk,parity);
+    std::unordered_map<std::uint64_t, edge *>::iterator it = s_graph->sparseEdges->find(key);
+    old_edge = (it == s_graph->sparseEdges->end()) ? NULL : it->second;
+    if ( old_edge == NULL ) {
+      new_edge = reinterpret_cast<edge *> (calloc(1,sizeof(edge)));
+      if ( new_edge == NULL ) alloc_error(const_cast<char*>("new_edge"));
+      new_edge->endpoint1 = indj; new_edge->endpoint2 = indk;
+      new_edge->weight = weight; new_edge->parity = parity;
+      new_edge->constr = i; new_edge->weak = i_weak;
+      (*s_graph->sparseEdges)[key] = new_edge;
+      s_graph->sparseAdj[indj].push_back(new_edge);
+      s_graph->sparseAdj[indk].push_back(new_edge);
+      (s_graph->nedges)++;
+    }
+    else {
+      if ( old_edge->weight > weight ) {
+        old_edge->weight = weight; old_edge->constr = i;
+        free_info_weak(old_edge->weak);
+        old_edge->weak = i_weak;
+      }
+      else {
+        free_info_weak(i_weak);
+      }
+    }
+    return(s_graph);
+  }
   indjk = SG_EDGE_INDEX(s_graph,indj,indk);
   if ( parity == EVEN ) old_edge = s_graph->even_adj_list[indjk];
   else old_edge = s_graph->odd_adj_list[indjk];
@@ -695,7 +1250,7 @@ separation_graph *update_weight_sep_graph(
   return(s_graph);
 }
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 void print_edge(edge *e)
 {
   printf("\n content of edge: endpoint1 = %d, endpoint2 = %d, weight = %f, parity = %d, constr = %d\n",
@@ -711,17 +1266,24 @@ void free_edge(edge *e)
   free(e);
 }
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 void print_sep_graph(separation_graph *s_graph)
 {
-  int nnodes, maxedges, jk;
+  int nnodes;
+  long long maxedges, jk;
   
   nnodes = s_graph->nnodes;
-  maxedges = (nnodes * (nnodes - 1)) / 2;
   printf("\n content of separation_graph: nnodes = %d, nedges = %d\n",
     nnodes, s_graph->nedges);
   print_int_vect(const_cast<char*>("nodes"),s_graph->nodes,nnodes);
   print_int_vect(const_cast<char*>("ind"),s_graph->ind,nnodes);
+  if ( s_graph->sparseMode ) {
+    for (std::unordered_map<std::uint64_t, edge *>::const_iterator it = s_graph->sparseEdges->begin();
+         it != s_graph->sparseEdges->end(); ++it)
+      print_edge(it->second);
+    return;
+  }
+  maxedges = (nnodes * (nnodes - 1)) / 2;
   for ( jk = 0; jk < maxedges; jk++ ) {
     if ( s_graph->even_adj_list[jk] != NULL )
       print_edge(s_graph->even_adj_list[jk]);
@@ -733,8 +1295,23 @@ void print_sep_graph(separation_graph *s_graph)
 
 void free_sep_graph(separation_graph *s_graph)
 {
-  int nnodes, maxedges, jk;
-  
+  int nnodes;
+  long long maxedges, jk;
+
+  if ( s_graph->sparseMode ) {
+    if ( s_graph->sparseEdges != NULL ) {
+      for (std::unordered_map<std::uint64_t, edge *>::const_iterator it = s_graph->sparseEdges->begin();
+           it != s_graph->sparseEdges->end(); ++it)
+        free_edge(it->second);
+      delete s_graph->sparseEdges;
+    }
+    delete [] s_graph->sparseAdj;
+    free(s_graph->nodes);
+    free(s_graph->ind);
+    free(s_graph);
+    return;
+  }
+
   nnodes = s_graph->nnodes;
   maxedges = (nnodes * (nnodes - 1)) / 2;
   for ( jk = 0; jk < maxedges; jk++ ) {
@@ -795,13 +1372,31 @@ auxiliary_graph *define_aux_graph(separation_graph *s_graph /* input separation 
   narcs = 0; 
   for ( j = 0; j < s_graph->nnodes; j++ ) {
     /* count the number of edges incident with j in the separation graph */
-    totoutj = 0;
-    for ( k = 0; k < s_graph->nnodes; k++ ) 
-      if ( k != j ) {
-	indjk = SG_EDGE_INDEX(s_graph,j,k);
-	if ( s_graph->even_adj_list[indjk] != NULL ) totoutj++;
-	if ( s_graph->odd_adj_list[indjk] != NULL ) totoutj++;
-      }
+    if ( s_graph->sparseMode ) {
+      std::vector<edge *> &incident = s_graph->sparseAdj[j];
+      std::sort(incident.begin(), incident.end(),
+        [j](const edge *lhs, const edge *rhs) {
+          const int lhsOther = lhs->endpoint1 == j ? lhs->endpoint2 : lhs->endpoint1;
+          const int rhsOther = rhs->endpoint1 == j ? rhs->endpoint2 : rhs->endpoint1;
+          if (lhsOther != rhsOther)
+            return lhsOther < rhsOther;
+          if (lhs->parity != rhs->parity)
+            return lhs->parity < rhs->parity;
+          if (lhs->constr != rhs->constr)
+            return lhs->constr < rhs->constr;
+          return lhs < rhs;
+        });
+      totoutj = static_cast<int>(incident.size());
+    }
+    else {
+      totoutj = 0;
+      for ( k = 0; k < s_graph->nnodes; k++ ) 
+        if ( k != j ) {
+	  indjk = SG_EDGE_INDEX(s_graph,j,k);
+	  if ( s_graph->even_adj_list[indjk] != NULL ) totoutj++;
+	  if ( s_graph->odd_adj_list[indjk] != NULL ) totoutj++;
+        }
+    }
     auxj1 = AG_TWIN1(j); auxj2 = AG_TWIN2(j);
     a_graph->nodes[auxj1].index = auxj1;
     a_graph->nodes[auxj2].index = auxj2;
@@ -814,48 +1409,96 @@ auxiliary_graph *define_aux_graph(separation_graph *s_graph /* input separation 
 #endif
     /* add the edges as arcs outgoing from j to the auxiliary graph */
     //noutj = 0;
-    for ( k = 0; k < s_graph->nnodes; k++ ) {
-      if ( k != j ) {
-	auxk1 = AG_TWIN1(k); auxk2 = AG_TWIN2(k);
-	indjk = SG_EDGE_INDEX(s_graph,j,k);
-	s_edge = s_graph->even_adj_list[indjk];
-	if ( s_edge != NULL ) {
-	  /* there is an even edge between j and k */        
+    if ( s_graph->sparseMode ) {
+      const std::vector<edge *> &incident = s_graph->sparseAdj[j];
+      for (std::vector<edge *>::const_iterator edgeIt = incident.begin(); edgeIt != incident.end(); ++edgeIt) {
+        s_edge = *edgeIt;
+        k = s_edge->endpoint1 == j ? s_edge->endpoint2 : s_edge->endpoint1;
+        auxk1 = AG_TWIN1(k); auxk2 = AG_TWIN2(k);
+        if ( s_edge->parity == EVEN ) {
 #ifndef CGL_NEW_SHORT
 	  a_graph->arcs[narcs].len = a_graph->arcs[narcs+totoutj].len = 
 	    (int) (s_edge->weight * ISCALE); 
 	  a_graph->arcs[narcs].head = &(a_graph->nodes[auxk1]);
 	  a_graph->arcs[narcs+totoutj].head = &(a_graph->nodes[auxk2]);
+          a_graph->arcs[narcs].backEdge = s_edge;
+          a_graph->arcs[narcs+totoutj].backEdge = s_edge;
 #else
 	  a_graph->arcs[narcs].length = a_graph->arcs[narcs+totoutj].length = 
 	    static_cast<int> (s_edge->weight * ISCALE); 
 	  a_graph->arcs[narcs].to = auxk1;
 	  a_graph->arcs[narcs+totoutj].to = auxk2;
+          a_graph->arcs[narcs].backEdge = s_edge;
+          a_graph->arcs[narcs+totoutj].backEdge = s_edge;
 #endif
 	  narcs++; //noutj++;
 	}
-	s_edge = s_graph->odd_adj_list[indjk];
-	if ( s_edge != NULL ) {
-	  /* there is an odd edge between j and k */        
+        else {
 #ifndef CGL_NEW_SHORT
 	  a_graph->arcs[narcs].len = a_graph->arcs[narcs+totoutj].len = 
 	    (int) (s_edge->weight * ISCALE); 
 	  a_graph->arcs[narcs].head = &(a_graph->nodes[auxk2]);
 	  a_graph->arcs[narcs+totoutj].head = &(a_graph->nodes[auxk1]);
+          a_graph->arcs[narcs].backEdge = s_edge;
+          a_graph->arcs[narcs+totoutj].backEdge = s_edge;
 #else
 	  a_graph->arcs[narcs].length = a_graph->arcs[narcs+totoutj].length = 
 	    static_cast<int> (s_edge->weight * ISCALE); 
 	  a_graph->arcs[narcs].to = auxk2;
 	  a_graph->arcs[narcs+totoutj].to = auxk1;
+          a_graph->arcs[narcs].backEdge = s_edge;
+          a_graph->arcs[narcs+totoutj].backEdge = s_edge;
 #endif
-	  /* this looks really useless - to be removed ...
-	  if ( noutj == 0 ) {
-	    a_graph->nodes[auxj1].first = &(a_graph->arcs[narcs]);
-	    a_graph->nodes[auxj2].first = &(a_graph->arcs[narcs+totoutj]);
-	  } 
-	  ... */
 	  narcs++; //noutj++;
 	}
+      }
+    }
+    else {
+      for ( k = 0; k < s_graph->nnodes; k++ ) {
+        if ( k != j ) {
+	  auxk1 = AG_TWIN1(k); auxk2 = AG_TWIN2(k);
+	  indjk = SG_EDGE_INDEX(s_graph,j,k);
+	  s_edge = s_graph->even_adj_list[indjk];
+	  if ( s_edge != NULL ) {
+	    /* there is an even edge between j and k */        
+#ifndef CGL_NEW_SHORT
+	    a_graph->arcs[narcs].len = a_graph->arcs[narcs+totoutj].len = 
+	      (int) (s_edge->weight * ISCALE); 
+	    a_graph->arcs[narcs].head = &(a_graph->nodes[auxk1]);
+	    a_graph->arcs[narcs+totoutj].head = &(a_graph->nodes[auxk2]);
+            a_graph->arcs[narcs].backEdge = s_edge;
+            a_graph->arcs[narcs+totoutj].backEdge = s_edge;
+#else
+	    a_graph->arcs[narcs].length = a_graph->arcs[narcs+totoutj].length = 
+	      static_cast<int> (s_edge->weight * ISCALE); 
+	    a_graph->arcs[narcs].to = auxk1;
+	    a_graph->arcs[narcs+totoutj].to = auxk2;
+            a_graph->arcs[narcs].backEdge = s_edge;
+            a_graph->arcs[narcs+totoutj].backEdge = s_edge;
+#endif
+	    narcs++; //noutj++;
+	  }
+	  s_edge = s_graph->odd_adj_list[indjk];
+	  if ( s_edge != NULL ) {
+	    /* there is an odd edge between j and k */        
+#ifndef CGL_NEW_SHORT
+	    a_graph->arcs[narcs].len = a_graph->arcs[narcs+totoutj].len = 
+	      (int) (s_edge->weight * ISCALE); 
+	    a_graph->arcs[narcs].head = &(a_graph->nodes[auxk2]);
+	    a_graph->arcs[narcs+totoutj].head = &(a_graph->nodes[auxk1]);
+            a_graph->arcs[narcs].backEdge = s_edge;
+            a_graph->arcs[narcs+totoutj].backEdge = s_edge;
+#else
+	    a_graph->arcs[narcs].length = a_graph->arcs[narcs+totoutj].length = 
+	      static_cast<int> (s_edge->weight * ISCALE); 
+	    a_graph->arcs[narcs].to = auxk2;
+	    a_graph->arcs[narcs+totoutj].to = auxk1;
+            a_graph->arcs[narcs].backEdge = s_edge;
+            a_graph->arcs[narcs+totoutj].backEdge = s_edge;
+#endif
+	    narcs++; //noutj++;
+	  }
+        }
       }
     }
     narcs += totoutj;
@@ -909,7 +1552,7 @@ auxiliary_graph *cancel_node_aux_graph(
   return(a_graph);
 }
   
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 #ifndef CGL_NEW_SHORT
 void print_node(node *n)
 {
@@ -1069,7 +1712,7 @@ short int same_cycle(cycle *s_cyc1, cycle *s_cyc2 /* cycles to be compared */)
   return(FALSE);
 }
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 void print_cycle(cycle *s_cycle)
 {
   int e;
@@ -1138,7 +1781,7 @@ void free_cycle_list(cycle_list *s_cycle_list)
   free(s_cycle_list);
 }
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 void print_cycle_list(cycle_list *s_cycle_list)
 {
   int c;
@@ -1155,7 +1798,7 @@ void print_cycle_list(cycle_list *s_cycle_list)
    for the shortest path computation - all the cycles in the list are
    different from each other */
 
-cycle_list *get_shortest_odd_cycle_list(
+cycle_list *Cgl012Cut::get_shortest_odd_cycle_list(
 					int j, /* first node to be visited by the odd cycle */
 					separation_graph *s_graph, /* current separation graph */
 					auxiliary_graph *a_graph /* auxiliary graph for the shortest path computation */
@@ -1173,11 +1816,13 @@ cycle_list *get_shortest_odd_cycle_list(
   cycle *s_cycle;
   cycle_list *s_cycle_list;
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tsi);
 #endif
  
   s_cycle_list = initialize_cycle_list((a_graph->nnodes)-2);
+  if (checkTimeLimit("shortest_odd_cycle timeout", "before shortest path"))
+    return(s_cycle_list);
 
   source = AG_TWIN1(j); sink = AG_TWIN2(j);
   //source_ptr = &(a_graph->nodes[source]);
@@ -1189,7 +1834,7 @@ cycle_list *get_shortest_odd_cycle_list(
      free due to symmetry) and store them (the path information is 
      hidden into aux_graph) */
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&ti);
 #endif
 #ifndef CGL_NEW_SHORT
@@ -1230,7 +1875,9 @@ cycle_list *get_shortest_odd_cycle_list(
 #else
   cglShortestPath(a_graph,source,ISCALE);
 #endif
-#ifdef TIME
+  if (checkTimeLimit("shortest_odd_cycle timeout", "after shortest path"))
+    return(s_cycle_list);
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tf);
   path_time += tf - ti;
 #endif
@@ -1238,6 +1885,12 @@ cycle_list *get_shortest_odd_cycle_list(
     reinterpret_cast<short_path_node *> (calloc(a_graph->nnodes,sizeof(short_path_node)));
   if ( forw_arb == NULL ) alloc_error(const_cast<char*>("forw_arb"));
   for ( k = 0; k < a_graph->nnodes; k++ ) { 
+    if ((k & 255) == 0 &&
+        checkTimeLimit("shortest_odd_cycle timeout", "while copying shortest-path trees")) {
+      free(forw_arb);
+      free_cycle_list(s_cycle_list);
+      return(initialize_cycle_list(1));
+    }
 #ifndef CGL_NEW_SHORT
     if ( a_graph->nodes[k].parent != NULL ) {
       forw_arb[k].dist = a_graph->nodes[k].dist;
@@ -1258,6 +1911,13 @@ cycle_list *get_shortest_odd_cycle_list(
     reinterpret_cast<short_path_node *> (calloc(a_graph->nnodes,sizeof(short_path_node)));
   if ( backw_arb == NULL ) alloc_error(const_cast<char*>("backw_arb"));
   for ( k = 0; k < a_graph->nnodes; k++ ) { 
+    if ((k & 255) == 0 &&
+        checkTimeLimit("shortest_odd_cycle timeout", "while copying reverse shortest-path tree")) {
+      free(forw_arb);
+      free(backw_arb);
+      free_cycle_list(s_cycle_list);
+      return(initialize_cycle_list(1));
+    }
 #ifndef CGL_NEW_SHORT
     if ( a_graph->nodes[k].parent != NULL ) {
       backw_arb[AG_MATE(k)].dist = a_graph->nodes[k].dist;
@@ -1280,11 +1940,11 @@ cycle_list *get_shortest_odd_cycle_list(
      (which coincides with the arborescence since aux_graph is 
      symmetrical) and store it */
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&ti);
 #endif
   cc = dikbd(a_graph->nnodes,first_ptr,sink_ptr,ISCALE);
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tf);
   path_time += tf - ti;
 #endif
@@ -1300,6 +1960,12 @@ cycle_list *get_shortest_odd_cycle_list(
   /* consider each possible intermediate node in aux_graph */
 
   for ( k = 0; k < s_graph->nnodes; k++ ) {
+    if ((k & 63) == 0 &&
+        checkTimeLimit("shortest_odd_cycle timeout", "while enumerating intermediate nodes")) {
+      free(forw_arb);
+      free(backw_arb);
+      return(s_cycle_list);
+    }
     if ( k != j ) {
       for ( t = 1; t <= 2; t++ ) {
 	if ( t == 1 ) kt = AG_TWIN1(k); 
@@ -1342,12 +2008,8 @@ cycle_list *get_shortest_odd_cycle_list(
 	    curr = kt;
 	    do {
 	      pred = forw_arb[curr].pred;
-	      if ( AG_TYPE(pred,curr) == EVEN ) 
-		curr_edge = s_graph->even_adj_list
-		  [SG_EDGE_INDEX(s_graph,SG_ORIG(curr),SG_ORIG(pred))]; 
-	      else
-		curr_edge = s_graph->odd_adj_list
-		  [SG_EDGE_INDEX(s_graph,SG_ORIG(curr),SG_ORIG(pred))]; 
+	      curr_edge = cglZeroHalfGetAuxiliaryArcEdge(a_graph,pred,curr);
+              if ( curr_edge == NULL ) abort();
 	      s_cycle->edge_list[totedges] = curr_edge;
 	      curr = pred; 
 	      totedges++;
@@ -1356,12 +2018,8 @@ cycle_list *get_shortest_odd_cycle_list(
 	    curr = kt;
 	    do {
 	      pred = backw_arb[curr].pred;
-	      if ( AG_TYPE(pred,curr) == EVEN ) 
-		curr_edge = s_graph->even_adj_list
-		  [SG_EDGE_INDEX(s_graph,SG_ORIG(curr),SG_ORIG(pred))]; 
-	      else
-		curr_edge = s_graph->odd_adj_list
-		  [SG_EDGE_INDEX(s_graph,SG_ORIG(curr),SG_ORIG(pred))]; 
+	      curr_edge = cglZeroHalfGetAuxiliaryArcEdge(a_graph,pred,curr);
+              if ( curr_edge == NULL ) abort();
 	      s_cycle->edge_list[totedges] = curr_edge;
 	      curr = pred; 
 	      totedges++;
@@ -1376,7 +2034,7 @@ cycle_list *get_shortest_odd_cycle_list(
   free(forw_arb);
   free(backw_arb);
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tsf);
   cycle_time += tsf - tsi;
 #endif
@@ -1400,7 +2058,7 @@ cut_list *initialize_cut_list(int max_cut /* maximum number of cuts in the list 
   return(cuts);
 }
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
 void Cgl012Cut::print_cut(cut *v_cut)
 {
   printf("\n content of cut: n_of_constr = %d, cnzcnt = %d, crhs = %d, csense = %c, violation = %f\n",
@@ -1531,12 +2189,16 @@ short int Cgl012Cut::best_cut(
      is not odd - this hopefully produces a stronger cut than that
      associated with the weakened inequalities to define the edges */
 
-  vars_to_weak = reinterpret_cast<int *> (calloc(inp_ilp->mc,sizeof(int)));
-  if ( vars_to_weak == NULL ) alloc_error(const_cast<char*>("vars_to_weak"));
+  ensureVarsToWeakBufferCapacity(inp_ilp->mc);
+  vars_to_weak = varsToWeakBuffer_.data();
   
   n_to_weak = 0;
   original_slack = 0.0;
   for ( j = 0; j < inp_ilp->mc; j++ ) {
+    if ((j & 4095) == 0 &&
+        checkTimeLimit("best_cut timeout", "while scanning cut coefficients")) {
+      return(FALSE);
+    }
     if ( ccoef[j] != 0 ) {
       if ( mod2(ccoef[j]) == ODD ) {
 	vars_to_weak[n_to_weak] = j;
@@ -1547,7 +2209,6 @@ short int Cgl012Cut::best_cut(
   }
   original_slack += static_cast<double> (*crhs);
   if ( original_slack > MAX_SLACK - EPS ) {
-    free(vars_to_weak);
     return(FALSE);
   }
   original_parity = mod2(*crhs);
@@ -1560,22 +2221,36 @@ short int Cgl012Cut::best_cut(
     *violation = ( 1.0 - best_odd_slack ) / 2.0;
     if ( ! update ) { 
       /* new ccoef and rhs are not required on output */
-      free(vars_to_weak);
       free_info_weak(info_odd_weak);
       return(TRUE);
     }
     /* update ccoef and crhs according to the best odd weakening */
     for ( j = 0; j < n_to_weak; j++ )
       if ( info_odd_weak->type[j] == LOWER_BOUND ) {
+        if ((j & 1023) == 0 &&
+            checkTimeLimit("best_cut timeout", "while applying weakening")) {
+          free_info_weak(info_odd_weak);
+          return(FALSE);
+        }
 	ccoef[vars_to_weak[j]]--;
 	*crhs -= inp_ilp->vlb[vars_to_weak[j]];
       }
       else {
+        if ((j & 1023) == 0 &&
+            checkTimeLimit("best_cut timeout", "while applying weakening")) {
+          free_info_weak(info_odd_weak);
+          return(FALSE);
+        }
 	ccoef[vars_to_weak[j]]++;
 	*crhs += inp_ilp->vub[vars_to_weak[j]];
       }
     /* compute and check the correctness of the cut coefficients */
     for ( j = 0; j < inp_ilp->mc; j++ ) {
+      if ((j & 4095) == 0 &&
+          checkTimeLimit("best_cut timeout", "while normalizing coefficients")) {
+        free_info_weak(info_odd_weak);
+        return(FALSE);
+      }
       if ( mod2(ccoef[j]) == ODD ) {
 	printf("!!! Error 2 in weakening a cut !!!\n");
 	exit(0);
@@ -1587,12 +2262,10 @@ short int Cgl012Cut::best_cut(
       exit(0);
     }
     *crhs = (*crhs - 1) / 2;
-    free(vars_to_weak);
     free_info_weak(info_odd_weak);
     return(TRUE);
   }
   else {
-    free(vars_to_weak);
     return(FALSE);
   }
 }
@@ -1612,8 +2285,14 @@ cut *Cgl012Cut::define_cut(
   if ( v_cut == NULL ) alloc_error(const_cast<char*>("v_cut"));
   v_cut->crhs = crhs;
   cnzcnt = 0;
-  for ( j = 0; j < inp_ilp->mc; j++ )
+  for ( j = 0; j < inp_ilp->mc; j++ ) {
+    if ((j & 4095) == 0 &&
+        checkTimeLimit("define_cut timeout", "while counting coefficients")) {
+      free(v_cut);
+      return(NULL);
+    }
     if ( ccoef[j] != 0 ) cnzcnt++;
+  }
   v_cut->cnzcnt = cnzcnt;
   v_cut->csense = 'L';
   v_cut->cind = reinterpret_cast<int *> (calloc(cnzcnt,sizeof(int)));
@@ -1621,13 +2300,19 @@ cut *Cgl012Cut::define_cut(
   v_cut->cval = reinterpret_cast<int *> (calloc(cnzcnt,sizeof(int)));
   if ( v_cut->cval == NULL ) alloc_error(const_cast<char*>("v_cut->cval"));
   cnzcnt = 0; v_cut->violation = 0.0;
-  for ( j = 0; j < inp_ilp->mc; j++ )
+  for ( j = 0; j < inp_ilp->mc; j++ ) {
+    if ((j & 4095) == 0 &&
+        checkTimeLimit("define_cut timeout", "while materializing coefficients")) {
+      free_cut(v_cut);
+      return(NULL);
+    }
     if ( ccoef[j] != 0 ) {
       v_cut->cind[cnzcnt] = j;
       v_cut->cval[cnzcnt] = ccoef[j];
       v_cut->violation += inp_ilp->xstar[j] * static_cast<double> (ccoef[j]);
       cnzcnt++;
     }
+  }
   v_cut->violation -= static_cast<double> (crhs); 
   return(v_cut);
 }
@@ -1655,7 +2340,7 @@ cut *Cgl012Cut::get_cut(
   static double gap, maxgap = 0.0;
 #endif
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tsi);
   cut_ncalls++;
 #endif
@@ -1663,7 +2348,7 @@ cut *Cgl012Cut::get_cut(
   /* compute the cut obtained by adding-up all the constraints 
      corresponding to edges in the cycle, in their non-weak form */
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tii);
 #endif
   
@@ -1683,6 +2368,13 @@ cut *Cgl012Cut::get_cut(
 #endif
   crhs = 0;
   for ( e = 0; e < s_cyc->length; e++ ) {
+    if ((e & 255) == 0 &&
+        checkTimeLimit("get_cut timeout", "while gathering cycle constraints")) {
+      free(ccoef);
+      free(comb);
+      free(flag_comb);
+      return(NULL);
+    }
     i = (s_cyc->edge_list[e])->constr; 
     if ( i >= 0 && flag_comb[i] != IN) {
       /* the edge is not associated with a bound constraint */
@@ -1692,7 +2384,7 @@ cut *Cgl012Cut::get_cut(
   }
   ok = get_ori_cut_coef(ncomb,comb,ccoef,&crhs,TRUE);
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tff);
   coef_time += tff - tii;
 #endif
@@ -1702,7 +2394,7 @@ cut *Cgl012Cut::get_cut(
     free(ccoef);
     free(comb);
     free(flag_comb);
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
     second_(&tsf);
     cut_time += tsf - tsi;
 #endif
@@ -1710,6 +2402,12 @@ cut *Cgl012Cut::get_cut(
   }
 
   v_cut = define_cut(ccoef,crhs);
+  if ( v_cut == NULL ) {
+    free(ccoef);
+    free(comb);
+    free(flag_comb);
+    return(NULL);
+  }
 iter++;
   if ( v_cut->violation > violation + EPS || 
        v_cut->violation < violation - EPS ) {
@@ -1734,7 +2432,7 @@ if ( gap > maxgap ) maxgap = gap;
 
   free(ccoef);
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tsf);
   cut_time += tsf - tsi;
 #endif
@@ -1895,18 +2593,15 @@ short int only_viol /* flag which tells whether only an inequality of
   short int *type_even_weak, *type_odd_weak,   
 	    *switch_even_weak, *switch_odd_weak;
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tii);
 #endif
 
-  type_even_weak = reinterpret_cast<short int *> (calloc(p_ilp->mc,sizeof(short int)));
-  if (type_even_weak == NULL ) alloc_error(const_cast<char*>("type_even_weak"));
-  switch_even_weak = reinterpret_cast<short int *> (calloc(p_ilp->mc,sizeof(short int)));
-  if (switch_even_weak == NULL ) alloc_error(const_cast<char*>("switch_even_weak"));
-  type_odd_weak = reinterpret_cast<short int *> (calloc(p_ilp->mc,sizeof(short int)));
-  if (type_odd_weak == NULL ) alloc_error(const_cast<char*>("type_odd_weak"));
-  switch_odd_weak = reinterpret_cast<short int *> (calloc(p_ilp->mc,sizeof(short int)));
-  if (switch_odd_weak == NULL ) alloc_error(const_cast<char*>("switch_odd_weak"));
+  ensureBestWeakeningBufferCapacity(p_ilp->mc);
+  type_even_weak = typeEvenWeakBuffer_.data();
+  switch_even_weak = switchEvenWeakBuffer_.data();
+  type_odd_weak = typeOddWeakBuffer_.data();
+  switch_odd_weak = switchOddWeakBuffer_.data();
 
   if ( original_parity == EVEN ) {
     (*best_even_slack) = original_slack;
@@ -1918,11 +2613,13 @@ short int only_viol /* flag which tells whether only an inequality of
   }
   nweak = 0;
   for ( ofsl = 0; ofsl < n_to_weak; ofsl++ ) {
+    if ((ofsl & 1023) == 0 &&
+        checkTimeLimit("best_weakening timeout", "while evaluating weakening options")) {
+      return(NONE);
+    }
     l = vars_to_weak[nweak];
     if ( p_ilp->possible_weak[l] == NONE ) {
-      free(type_even_weak); free(type_odd_weak);
-      free(switch_even_weak); free(switch_odd_weak);
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
       second_(&tff);
       bw_time += tff - tii;
 #endif
@@ -1978,9 +2675,7 @@ short int only_viol /* flag which tells whether only an inequality of
     if ( ( only_viol ) &&
 	 ( (*best_even_slack) > MAX_SLACK - EPS ) &&
 	 ( (*best_odd_slack) > MAX_SLACK - EPS ) ) {
-      free(type_even_weak); free(type_odd_weak);
-      free(switch_even_weak); free(switch_odd_weak);
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
       second_(&tff);
       bw_time += tff - tii;
 #endif
@@ -2001,6 +2696,12 @@ short int only_viol /* flag which tells whether only an inequality of
     flag_even = EVEN;
     cntweak = nweak; 
     for ( ofsl = n_to_weak - 1; ofsl >= 0; ofsl-- ) {
+      if (((n_to_weak - 1 - ofsl) & 1023) == 0 &&
+          checkTimeLimit("best_weakening timeout", "while building even weakening")) {
+        free_info_weak(*info_even_weak);
+        *info_even_weak = NULL;
+        return(NONE);
+      }
       cntweak--;
       (*info_even_weak)->var[cntweak] = vars_to_weak[ofsl];
       if ( flag_even == EVEN ) {
@@ -2023,6 +2724,15 @@ short int only_viol /* flag which tells whether only an inequality of
     flag_odd = ODD;
     cntweak = nweak; 
     for ( ofsl = n_to_weak - 1; ofsl >= 0; ofsl-- ) {
+      if (((n_to_weak - 1 - ofsl) & 1023) == 0 &&
+          checkTimeLimit("best_weakening timeout", "while building odd weakening")) {
+        if (ok_even)
+          free_info_weak(*info_even_weak);
+        *info_even_weak = NULL;
+        free_info_weak(*info_odd_weak);
+        *info_odd_weak = NULL;
+        return(NONE);
+      }
       cntweak--;
       (*info_odd_weak)->var[cntweak] = vars_to_weak[ofsl];
       if ( flag_odd == EVEN ) {
@@ -2037,9 +2747,7 @@ short int only_viol /* flag which tells whether only an inequality of
   }
   else ok_odd = FALSE;
 
-  free(type_even_weak); free(type_odd_weak);
-  free(switch_even_weak); free(switch_odd_weak);
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tff);        
   bw_time += tff - tii;
 #endif
@@ -2072,32 +2780,58 @@ cut_list *Cgl012Cut::basic_separation()
   print_parity_ilp();
 #endif
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&td);
 #endif
-#ifdef PRINT_TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
   printf("... time elapsed at the beginning of basic_separation: %f\n",td - tti);
 #endif
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&td);
 #endif
-#ifdef PRINT_TIME
+  #ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
   printf("... time elapsed before initialize_sep_graph: %f\n",td - tti);
-#endif
+  #endif
   sep_graph = initialize_sep_graph();
+  if ( sep_graph == NULL ) return(initialize_cut_list(1));
   special = p_ilp->mc;
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&td);
 #endif
-#ifdef PRINT_TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
   printf("... time elapsed before weakening: %f\n",td - tti);
 #endif
 
   /* edges associated with actual constraints in the ILP */
 
   for ( i = 0; i < p_ilp->mr; i++ ) {
+    if ((i & 255) == 0 &&
+        checkTimeLimit("basic_separation timeout", "during separation-graph construction")) {
+      free_sep_graph(sep_graph);
+      return(initialize_cut_list(1));
+    }
     if ( ! p_ilp->row_to_delete[i] ) {
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+      const double zhRowStartSeconds = CoinGetTimeOfDay();
+#endif
       begi = p_ilp->mtbeg[i];
+      int zhRowPairCount = 0;
+      if ( p_ilp->mtcnt[i] <= 2 )
+        zhRowPairCount = (p_ilp->mtcnt[i] >= 1) ? 1 : 0;
+      else
+        zhRowPairCount = (p_ilp->mtcnt[i] * (p_ilp->mtcnt[i] - 1)) / 2;
+      if ( rowMaxPairCount_ >= 0 && zhRowPairCount > rowMaxPairCount_ )
+        continue;
+      if ( rowMaxFractionalCount_ >= 0 ) {
+        int zhFractionalHistogram[10];
+        int zhFractionalCount = 0;
+        int zhVeryFractionalCount = 0;
+        double zhFractionalSum = 0.0;
+        cglZeroHalfCollectFractionality(inp_ilp, i, zhFractionalHistogram,
+          &zhFractionalCount, &zhFractionalSum, &zhVeryFractionalCount);
+        if ( zhFractionalCount > rowMaxFractionalCount_ )
+          continue;
+      }
       if ( p_ilp->mtcnt[i] == 1 ) {
 	/* row with one odd entry only: edge j -- special */
 	weight = p_ilp->slack[i];
@@ -2125,14 +2859,22 @@ cut_list *Cgl012Cut::basic_separation()
 	/* row with three or more odd entries: weakening for all 1's pairs */
 	for ( ofsj = 0; ofsj < p_ilp->mtcnt[i]; ofsj++ ) {
 	  for ( ofsk = ofsj + 1; ofsk < p_ilp->mtcnt[i]; ofsk++ ) {
+            if (((ofsj * p_ilp->mtcnt[i]) + ofsk) % 16384 == 0 &&
+                checkTimeLimit("basic_separation timeout", "during row weakening")) {
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+              zhProfileRecordRow(i, CoinGetTimeOfDay() - zhRowStartSeconds, zhRowPairCount);
+#endif
+              free_sep_graph(sep_graph);
+              return(initialize_cut_list(1));
+            }
 	    /* edge(s) j -- k */
 	    j = p_ilp->mtind[begi+ofsj];
 	    k = p_ilp->mtind[begi+ofsk];
 	    original_slack = p_ilp->slack[i];
 	    original_parity = p_ilp->mrhs[i];
 	    n_to_weak = 0;
-	    vars_to_weak = reinterpret_cast<int *> (calloc(inp_ilp->mc,sizeof(int)));
-	    if ( vars_to_weak == NULL ) alloc_error(const_cast<char*>("vars_to_weak")); 
+	    ensureVarsToWeakBufferCapacity(inp_ilp->mc);
+	    vars_to_weak = varsToWeakBuffer_.data();
 	    for ( ofsl = 0; ofsl < p_ilp->mtcnt[i]; ofsl++ ) 
 	      if ( ofsl != ofsj && ofsl != ofsk ) {
 		l = p_ilp->mtind[begi+ofsl];
@@ -2144,7 +2886,13 @@ cut_list *Cgl012Cut::basic_separation()
 				     &best_even_slack,&best_odd_slack,
 				     &info_even_weak,&info_odd_weak,
 				     FALSE,TRUE); 
-	    free(vars_to_weak); 
+            if ( timeLimitReached() ) {
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+              zhProfileRecordRow(i, CoinGetTimeOfDay() - zhRowStartSeconds, zhRowPairCount);
+#endif
+              free_sep_graph(sep_graph);
+              return(initialize_cut_list(1));
+            }
 	    if ( ok_weak == NONE ) goto EXITJK;
 	    if ( ok_weak == BOTH || ok_weak == EVEN ) {
 	      if ( best_even_slack < MAX_SLACK - EPS ) {
@@ -2160,9 +2908,12 @@ cut_list *Cgl012Cut::basic_separation()
 		  (j,k,weight,parity,i,info_odd_weak,sep_graph);
 	      }
 	    }
-EXITJK:;  }
+ EXITJK:;  }
 	}
       }
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+      zhProfileRecordRow(i, CoinGetTimeOfDay() - zhRowStartSeconds, zhRowPairCount);
+#endif
     }
   }
 
@@ -2187,7 +2938,7 @@ EXITJK:;  }
       }
     }
   }   
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tf);
   weak_time += tf - ti;
 #endif
@@ -2201,17 +2952,17 @@ EXITJK:;  }
   print_sep_graph(sep_graph);
 #endif
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&ti);
 #endif
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&td);
 #endif
-#ifdef PRINT_TIME
+  #ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
   printf("... time elapsed before define_aux_graph: %f\n",td - tti);
-#endif
+  #endif
   aux_graph = define_aux_graph(sep_graph);
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tf);
   aux_time += tf - ti;
 #endif
@@ -2221,22 +2972,33 @@ EXITJK:;  }
   
 /* exit(1); */
   
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&td);
 #endif
-#ifdef PRINT_TIME
+  #ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
   printf("... time elapsed before cycles and cuts: %f\n",td - tti);
   printf("%d nodes on list\n",sep_graph->nnodes);
-#endif
+  #endif
   out_cuts = initialize_cut_list(MAX_CUTS);
   for ( j = 0; j < sep_graph->nnodes; j++ ) {
+    if ((j & 15) == 0 &&
+        checkTimeLimit("basic_separation timeout", "during odd-cycle search"))
+      goto EXIT_CUTS;
     short_cycle_list = get_shortest_odd_cycle_list(j,sep_graph,aux_graph);
+    if ( timeLimitReached() ) {
+      free_cycle_list(short_cycle_list);
+      goto EXIT_CUTS;
+    }
     if ( short_cycle_list == NULL ) goto EXIT_NODE;
 #ifdef PRINT
     print_cycle_list(short_cycle_list);
 #endif
     for ( c = 0; c < short_cycle_list->cnum; c++ ) {
       violated_cut = get_cut(short_cycle_list->list[c]);
+      if ( timeLimitReached() ) {
+        free_cycle_list(short_cycle_list);
+        goto EXIT_CUTS;
+      }
       if ( violated_cut == NULL ) {
 	if (!errorNo)
 	  continue;
@@ -2248,7 +3010,14 @@ EXITJK:;  }
 #endif
       if ( violated_cut->violation > MIN_VIOLATION + EPS ) {
 	/* violated 0-1/2 cut found */  
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+        const int previousCutCount = out_cuts->cnum;
+#endif
 	out_cuts = add_cut_to_list(violated_cut,out_cuts);  
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+        if (out_cuts->cnum > previousCutCount)
+          zhProfileRecordCut(violated_cut);
+#endif
 	if ( out_cuts->cnum >= MAX_CUTS ) {
 	  free_cycle_list(short_cycle_list);
 	  goto EXIT_CUTS; 
@@ -2266,15 +3035,15 @@ EXIT_CUTS:
   free_sep_graph(sep_graph);
   free_aux_graph(aux_graph);
 
-#ifdef PRINT_CUTS
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_CUTS
   print_cut_list(out_cuts);
 #endif
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&td);
 #endif
-#ifdef PRINT_TIME
+  #ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
   printf("... time elapsed at the end of basic_separation: %f\n",td - tti);
-#endif
+  #endif
 
   return(out_cuts);
 }
@@ -2412,7 +3181,7 @@ void free_cur_cut()
   free(cur_cut);
 }
 
-#ifdef PRINT_TABU
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TABU
 /* print_cur_cut: display cur_cut on output */
 
 void Cgl012Cut::print_cur_cut()
@@ -2929,14 +3698,14 @@ short int Cgl012Cut::best_neighbour(cut_list *out_cuts /* list of the violated c
   } /* for ( i = 0; i < m; i++ ) */
   
   if ( ibest == NONE ) {
-#ifdef PRINT_TABU
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TABU
     printf("No move could be performed by best_neighbour\n");
 #endif
     return(TRUE);
   }
   modify_current(ibest,itypebest);  
   if ( cur_cut->violation > MIN_VIOLATION + EPS ) {
-#ifdef PRINT_TABU
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TABU
     printf("... adding the current cut to the output list - it = %d viol = %f\n",it, cur_cut->violation);
 #endif
     new_cut = get_current_cut();
@@ -3068,7 +3837,7 @@ cut_list *Cgl012Cut::tabu_012()
   do {
     memory_reaction();
     failure = best_neighbour(out_cuts);
-#ifdef PRINT_TABU
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TABU
     print_cur_cut();
 #endif
     it++;
@@ -3077,7 +3846,7 @@ cut_list *Cgl012Cut::tabu_012()
   }
   while ( out_cuts->cnum < MAX_CUTS && it < MAX_TABU_ITER );
   free_memory();
-#ifdef PRINT_TABU
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TABU
     printf("Number of violated cuts found by Tabu Search %d\n",out_cuts->cnum);
     printf("Tabu Search timings: best_neighbour %f  score_by_moving %f coefficient %f  best_cut %f\n",
 	   time_best_neigh, time_scor_by_mov, time_coef, time_best_cut);
@@ -3537,16 +4306,18 @@ char **csense /* senses of the cuts: 'L', 'G' or 'E' */
 */
 		)
 {
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   float tbasi, tbasf;
 #endif
   errorNo=0;
   cut_list *out_cuts, *add_cuts;
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tti);
 #endif
 
   aggr = aggressive; 
+  profileStartSeconds_ = CoinGetTimeOfDay();
+  resetTimeCheckState();
 
   /* load the input ILP into an internal data structure */
   
@@ -3561,7 +4332,7 @@ char **csense /* senses of the cuts: 'L', 'G' or 'E' */
      which can be useful for 0-1/2 cut separation  - this may in fact be
      done only at the first call of the separation procedure */
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&ti);
 #endif
 
@@ -3572,7 +4343,7 @@ print_double_vect("xstar",p_ilp->xstar,p_ilp->mc);
 print_parity_ilp();
 */
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tf);
   prep_time += tf - ti;
 #endif
@@ -3584,7 +4355,7 @@ print_parity_ilp();
 #endif
     //free_ilp();
     //free_parity_ilp();
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&ttf);
   total_time += ttf - tti;
 #endif 
@@ -3595,19 +4366,22 @@ print_parity_ilp();
 
   sep_iter++;
   update_log_var();
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+  zhProfileStartRound();
+#endif
 
 #ifdef POOL
 
   /* search for possible violated cuts in the pool */
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tpi);
 #endif
   add_cuts = get_cuts_from_pool(FALSE);
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tpf);
   pool_time += tpf - tpi;
-#ifdef PRINT_TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
   printf("... time elapsed at the end of get_cuts_from_pool: %f\n",tpf - tti);
 #endif
 #endif
@@ -3625,13 +4399,16 @@ print_parity_ilp();
   /* try to identify violated 0-1/2 cuts by using the original procedure 
      described in Caprara and Fischetti's MP paper */
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tbasi);
 #endif
   
-  out_cuts = basic_separation(); 
+  out_cuts = basic_separation();
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+  zhProfileFlushRound(sep_iter, out_cuts ? out_cuts->cnum : 0);
+#endif
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tbasf);
   tot_basic_sep_time += tbasf - tbasi;
   avg_basic_sep_time = tot_basic_sep_time / (float) sep_iter;
@@ -3645,13 +4422,13 @@ print_parity_ilp();
   if ( out_cuts->cnum == 0 ) {
     free_cut_list(out_cuts); 
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&ttabi);
 #endif
 
     out_cuts = tabu_012(); 
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&ttabf);
   tabu_time += ttabf - ttabi;
 #endif
@@ -3664,7 +4441,7 @@ print_parity_ilp();
 
   /* add the cuts separated to the pool */
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tpi);
 #endif
   add_cuts_to_pool(out_cuts);
@@ -3674,10 +4451,10 @@ print_parity_ilp();
      to be added to the current LP */
 
   add_cuts = get_cuts_from_pool(TRUE);
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&tpf);
   pool_time += tpf - tpi;
-#ifdef PRINT_TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_PRINT_TIMING
   printf("... time elapsed at the end of get_cuts_from_pool: %f\n",tpf - tti);
 #endif
 #endif
@@ -3693,7 +4470,7 @@ print_parity_ilp();
   //free_ilp();
   //free_parity_ilp();
   
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
   second_(&ttf);
   total_time += ttf - tti;
 #endif 
@@ -3710,7 +4487,7 @@ print_parity_ilp();
   }
 }
 
-#ifdef TIME
+#ifdef CGL_ZH_ADVANCED_DEBUG_TIMING
 /* print_times: print the timings of the separation procedure */
 
 void print_times()
@@ -3732,7 +4509,14 @@ Cgl012Cut::Cgl012Cut () :
   errorNo(0),
   sep_iter(0),
   vlog(NULL),
-  aggr(true)
+  aggr(true),
+  maxSeconds_(0.0),
+  profileStartSeconds_(0.0),
+  timeLimitReached_(false),
+  timeCheckCountdown_(1),
+  sepGraphSparseThreshold_(MAX_SEP_GRAPH_ACTIVE_NODES),
+  rowMaxPairCount_(-1),
+  rowMaxFractionalCount_(-1)
 {
   // nothing to do here
 }
@@ -3748,7 +4532,14 @@ Cgl012Cut::Cgl012Cut (const Cgl012Cut & rhs) :
   errorNo(rhs.errorNo),
   sep_iter(rhs.sep_iter),
   vlog(NULL),
-  aggr(rhs.aggr)
+  aggr(rhs.aggr),
+  maxSeconds_(rhs.maxSeconds_),
+  profileStartSeconds_(0.0),
+  timeLimitReached_(false),
+  timeCheckCountdown_(1),
+  sepGraphSparseThreshold_(rhs.sepGraphSparseThreshold_),
+  rowMaxPairCount_(rhs.rowMaxPairCount_),
+  rowMaxFractionalCount_(rhs.rowMaxFractionalCount_)
 {
   if (rhs.p_ilp||rhs.vlog||inp_ilp)
     abort();  
@@ -3759,6 +4550,9 @@ Cgl012Cut::Cgl012Cut (const Cgl012Cut & rhs) :
 //-------------------------------------------------------------------
 Cgl012Cut::~Cgl012Cut ()
 {
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+  cglZeroHalfConstraintProfileStates().erase(this);
+#endif
   free_log_var();
   free_parity_ilp();
   free_ilp();
@@ -3772,6 +4566,9 @@ Cgl012Cut::operator=(
                    const Cgl012Cut& rhs)
 {
   if (this != &rhs) {
+#ifdef CGL_ZH_ADVANCED_DEBUG_CONSTRAINT_PROFILING
+    cglZeroHalfConstraintProfileStates().erase(this);
+#endif
     if (rhs.p_ilp||rhs.vlog||inp_ilp)
       abort();  
     free_log_var();
@@ -3794,6 +4591,52 @@ Cgl012Cut::operator=(
     errorNo = rhs.errorNo;
     sep_iter = rhs.sep_iter;
     aggr = rhs.aggr;
+    maxSeconds_ = rhs.maxSeconds_;
+    profileStartSeconds_ = 0.0;
+    resetTimeCheckState();
+    sepGraphSparseThreshold_ = rhs.sepGraphSparseThreshold_;
+    rowMaxPairCount_ = rhs.rowMaxPairCount_;
+    rowMaxFractionalCount_ = rhs.rowMaxFractionalCount_;
   }
   return *this;
+}
+
+void Cgl012Cut::setMaxSeconds(double value)
+{
+  maxSeconds_ = value;
+}
+
+double Cgl012Cut::getMaxSeconds() const
+{
+  return maxSeconds_;
+}
+
+void Cgl012Cut::setSepGraphSparseThreshold(int value)
+{
+  sepGraphSparseThreshold_ = value;
+}
+
+int Cgl012Cut::getSepGraphSparseThreshold() const
+{
+  return sepGraphSparseThreshold_;
+}
+
+void Cgl012Cut::setRowMaxPairCount(int value)
+{
+  rowMaxPairCount_ = value;
+}
+
+int Cgl012Cut::getRowMaxPairCount() const
+{
+  return rowMaxPairCount_;
+}
+
+void Cgl012Cut::setRowMaxFractionalCount(int value)
+{
+  rowMaxFractionalCount_ = value;
+}
+
+int Cgl012Cut::getRowMaxFractionalCount() const
+{
+  return rowMaxFractionalCount_;
 }

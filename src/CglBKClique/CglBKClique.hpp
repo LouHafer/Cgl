@@ -8,7 +8,7 @@
  * @file CglBKClique.hpp
  * @brief Clique cut separator
  * @author Samuel Souza Brito and Haroldo Gambini Santos
- * Contact: samuelbrito@ufop.edu.br and haroldo@ufop.edu.br
+ * Contact: samuelbrito@ufop.edu.br and haroldo.santos@gmail.com
  * @date 03/27/2020
  *
  * \copyright{Copyright 2020 Brito, S.S. and Santos, H.G.}
@@ -21,6 +21,8 @@
 
 #include <CglCutGenerator.hpp>
 #include "CoinBronKerbosch.hpp"
+#include "CoinCutPool.hpp"
+#include <atomic>
 
 class CoinCliqueList;
 class CoinConflictGraph;
@@ -39,20 +41,20 @@ public:
   /**
    * Copy constructor
    **/
-  CglBKClique(const CglBKClique& rhs);
+  CglBKClique(const CglBKClique &rhs);
 
   /**
    * Clone
    **/
-  virtual CglCutGenerator * clone() const;
+  virtual CglCutGenerator *clone() const;
 
   /**
    * Generate clique cuts for the model data contained
-   * in si. The generated cuts are inserted into and returned 
-   * in the collection of cuts cs. 
+   * in si. The generated cuts are inserted into and returned
+   * in the collection of cuts cs.
    **/
   virtual void generateCuts(const OsiSolverInterface &si, OsiCuts &cs, const CglTreeInfo info = CglTreeInfo());
-  
+
   /**
    * Destructor
    **/
@@ -74,6 +76,33 @@ public:
    * by BK algorithm.
    **/
   size_t getMaxCallsBK() const { return maxCallsBK_; }
+
+  /**
+   * Set the wall-clock budget (in seconds) for a single generateCuts() call.
+   * BK recursion is curtailed when the deadline approaches.
+   * 0.0 = no limit (default).
+   **/
+  void setMaxSeconds(double maxSeconds) { maxSeconds_ = maxSeconds; }
+
+  /**
+   * Return the current wall-clock budget.
+   **/
+  double getMaxSeconds() const { return maxSeconds_; }
+
+  /**
+   * Set the maximum number of induced-subgraph vertices passed to BK.
+   * When the LP solution produces more fractional/complement vertices than
+   * this limit, they are ranked by LP-value * sqrt(conflict-degree) and only
+   * the top maxInducedSize_ are kept.  This bounds the O(n^2) bitstring
+   * construction cost in CoinBronKerbosch.
+   * 0 = unlimited (default 10000).
+   **/
+  void setMaxInducedSize(size_t maxInducedSize) { maxInducedSize_ = maxInducedSize; }
+
+  /**
+   * Return the current induced-subgraph size cap.
+   **/
+  size_t getMaxInducedSize() const { return maxInducedSize_; }
 
   /**
    * Set the strategy used to extend cliques:
@@ -125,15 +154,22 @@ public:
   void setPivotingStrategy(const CoinBronKerbosch::PivotingStrategy pivotingStrategy);
 
   /**
+   * When the CoinCutPool filters this generator's cuts, see
+   * CoinCutPoolGate. The defaults are CoinCutPoolGate's.
+   **/
+  void setPoolGate(const CoinCutPoolGate &gate) { poolGate_ = gate; }
+  const CoinCutPoolGate &getPoolGate() const { return poolGate_; }
+
+  /**
    * Number of cuts separated.
    **/
-  static size_t sepCuts_;
+  static std::atomic< size_t > sepCuts_;
 
   /**
    * Execution time spent for the clique
    * cut separator.
    **/
-  static double sepTime_;
+  static std::atomic< double > sepTime_;
 
 private:
   /**
@@ -146,14 +182,14 @@ private:
    * Execute the clique cut separation.
    * Return a list of violated cliques.
    **/
-  CoinCliqueList* separateCliques(const OsiSolverInterface &si);
-  
+  CoinCliqueList *separateCliques(const OsiSolverInterface &si);
+
   /**
    * Execute the clique extension procedure.
    * Return a list of violated cliques.
    **/
-  CoinCliqueList* extendCliques(const OsiSolverInterface &si, const CoinCliqueList *initialCliques);
-  
+  CoinCliqueList *extendCliques(const OsiSolverInterface &si, const CoinCliqueList *initialCliques);
+
   /**
    * Insert the violated cuts in OsiCuts cs.
    **/
@@ -243,6 +279,25 @@ private:
    * stopping by maxCallsBK).
    **/
   bool completeBK_;
+
+  /**
+   * Wall-clock budget in seconds for a single generateCuts() call.
+   * 0.0 = no limit.
+   **/
+  double maxSeconds_;
+
+  /**
+   * Cap on the number of induced-subgraph vertices sent to BK.
+   * When the LP produces more fractional (original + complement) vertices,
+   * they are ranked by LP-value * sqrt(conflict-degree) and only the top
+   * maxInducedSize_ survive.  0 = unlimited.
+   **/
+  size_t maxInducedSize_;
+
+  /**
+   * When the cut pool filters, see setPoolGate().
+   **/
+  CoinCutPoolGate poolGate_;
 
   /**
    * Auxiliary structure used to temporary

@@ -9,7 +9,7 @@
  * @file CglCliqueStrengthening.cpp
  * @brief Conflict-based preprocessing
  * @author Samuel Souza Brito and Haroldo Gambini Santos
- * Contact: samuelbrito@ufop.edu.br and haroldo@ufop.edu.br
+ * Contact: samuelbrito@ufop.edu.br and haroldo.santos@gmail.com
  * @date 03/27/2020
  *
  * \copyright{Copyright 2020 Brito, S.S. and Santos, H.G.}
@@ -24,6 +24,7 @@
 #include "CoinStaticConflictGraph.hpp"
 #include "CoinCliqueExtender.hpp"
 #include "CglMessage.hpp"
+#include "CoinTime.hpp"
 
 #define CLQ_STR_EPS 1e-6
 #define MAX_SIZE_CLIQUE_TO_BE_EXTENDED 256
@@ -95,7 +96,7 @@ size_t CliqueRows::rows() const {
 }
 
 CglCliqueStrengthening::CglCliqueStrengthening(OsiSolverInterface *model, CoinMessageHandler *dhandler) :
-nExtended_(0), nDominated_(0), handler_(NULL), defaultHandler_(true) {
+nExtended_(0), nDominated_(0), maxSeconds_(0.0), startTime_(0.0), handler_(NULL), defaultHandler_(true) {
 
   if (dhandler)
     this->passInMessageHandler(dhandler);
@@ -110,10 +111,12 @@ nExtended_(0), nDominated_(0), handler_(NULL), defaultHandler_(true) {
   posInClqRows_ = NULL;
   nColClqs_ = NULL;
   colClqs_ = NULL;
+  dirtyRows_ = NULL;
 
   if (model_->getNumElements() > 0) {
     cliqueRows_ = new CliqueRows(model_->getNumRows(), model_->getNumElements());
     posInClqRows_ = (size_t*)xmalloc(sizeof(size_t) * model_->getNumRows());
+    dirtyRows_ = (size_t*)xmalloc(sizeof(size_t) * model_->getNumRows());
 
     detectCliqueRows();
     fillCliquesByColumn();
@@ -132,6 +135,7 @@ CglCliqueStrengthening::~CglCliqueStrengthening() {
     free(colClqs_[0]);
     free(colClqs_);
     free(posInClqRows_);
+    free(dirtyRows_);
   }
 }
 
@@ -226,17 +230,17 @@ void CglCliqueStrengthening::fillCliquesByColumn() {
       nElements++;
     }
   }
-  
+
   colClqs_ = (size_t **) xmalloc(sizeof(size_t *) * numCols * 2);
   colClqs_[0] = (size_t *) xmalloc(sizeof(size_t) * nElements);
-  
+
   for (size_t i = 1; i < numCols * 2; i++) {
     colClqs_[i] = colClqs_[i - 1] + nColClqs_[i - 1];
     nColClqs_[i - 1] = 0;
   }
 
   nColClqs_[(2 * numCols) - 1] = 0;
-  
+
   for (size_t i = 0; i < cliqueRows_->rows(); i++) {
     const size_t *clqEl = cliqueRows_->row(i);
 
@@ -249,6 +253,7 @@ void CglCliqueStrengthening::fillCliquesByColumn() {
 
 void CglCliqueStrengthening::strengthenCliques(size_t extMethod) {
   nExtended_ = nDominated_ = 0;
+  startTime_ = CoinWallclockTime();
 
   if (model_->getNumCols() == 0 || model_->getNumRows() == 0 || cliqueRows_->rows() == 0) {
     if (handler_->logLevel())
@@ -274,6 +279,7 @@ void CglCliqueStrengthening::strengthenCliques(size_t extMethod) {
 
 void CglCliqueStrengthening::strengthenCliques(size_t n, const size_t rows[], size_t extMethod) {
   nExtended_ = nDominated_ = 0;
+  startTime_ = CoinWallclockTime();
 
   if (model_->getNumCols() == 0 || model_->getNumRows() == 0 || cliqueRows_->rows() == 0) {
     if (handler_->logLevel())
@@ -316,26 +322,19 @@ void CglCliqueStrengthening::cliqueExtension(size_t extMethod, CoinCliqueSet *ne
   clqe.setMaxCandidates(512);
 
   for (size_t i = 0; i < cliqueRows_->rows(); i++) {
+    if (maxSeconds_ > 0.0 && (i & 63) == 0) {
+      if (CoinWallclockTime() - startTime_ >= maxSeconds_)
+        break;
+    }
     const size_t clqOrigRowIdx = cliqueRows_->origIdxRow(i);
     const size_t *clqIdx = cliqueRows_->row(i);
     const size_t clqSize = cliqueRows_->nz(i);
 
 #ifdef DEBUGCG
     bool goodClique = CoinCliqueList::validateClique(cgraph_, clqIdx, clqSize);
-#else
-    bool goodClique = true;
-    for (size_t k = 0; k < clqSize - 1; k++) {
-      for (size_t j = k + 1; j < clqSize; j++) {
-	if ((!cgraph_->conflicting(clqIdx[k], clqIdx[j])) || (clqIdx[k] == clqIdx[j])) {
-	  //fprintf(stderr, "ERROR: Nodes %ld and %ld are not in conflict.\n", clqIdx[k], clqIdx[j]);
-	  goodClique = false;
-	}
-      }
-    }
-#endif
     if (!goodClique)
       continue;
-    
+#endif
 
     if (cliqueRows_->status(i) == Dominated) {
         continue;
@@ -346,7 +345,7 @@ void CglCliqueStrengthening::cliqueExtension(size_t extMethod, CoinCliqueSet *ne
     if (extended) {
       cliqueRows_->setStatus(i, Dominated);
       nExtended_++;
-      
+
       const size_t lastClq = clqe.nCliques() - 1;
       const bool inserted = newCliques->insertIfNotDuplicate(clqe.getCliqueSize(lastClq), clqe.getClique(lastClq));
 
@@ -385,6 +384,10 @@ void CglCliqueStrengthening::cliqueExtension(size_t extMethod, CoinCliqueSet *ne
   clqe.setMaxCandidates(512);
 
   for (size_t i = 0; i < n; i++) {
+    if (maxSeconds_ > 0.0 && (i & 63) == 0) {
+      if (CoinWallclockTime() - startTime_ >= maxSeconds_)
+        break;
+    }
     const size_t rowIdx = posInClqRows_[rows[i]];
     const size_t clqOrigRowIdx = cliqueRows_->origIdxRow(rowIdx);
     const size_t *clqIdx = cliqueRows_->row(rowIdx);
@@ -403,7 +406,7 @@ void CglCliqueStrengthening::cliqueExtension(size_t extMethod, CoinCliqueSet *ne
     if (extended) {
       cliqueRows_->setStatus(rowIdx, Dominated);
       nExtended_++;
-      
+
       const size_t lastClq = clqe.nCliques() - 1;
       const bool inserted = newCliques->insertIfNotDuplicate(clqe.getCliqueSize(lastClq), clqe.getClique(lastClq));
 
@@ -436,7 +439,7 @@ double* CglCliqueStrengthening::getReducedCost() {
         rc[i + numCols] = -rc[i];
       }
   }
-  
+
   return rc;
 }
 
@@ -454,6 +457,7 @@ void CglCliqueStrengthening::checkDominance(const size_t *extClqEl, size_t extCl
     ivCol[extClqEl[i]] = true;
   }
 
+  size_t nDirty = 0;
   for (size_t i = 0; i < extClqSize; i++) {
     size_t col = extClqEl[i];
 
@@ -467,6 +471,7 @@ void CglCliqueStrengthening::checkDominance(const size_t *extClqEl, size_t extCl
       }
 
       ivRow[clqRowIdx] = true;
+      dirtyRows_[nDirty++] = clqRowIdx;
 
       const size_t *clqEl = cliqueRows_->row(clqRowIdx);
       const size_t clqNZ = cliqueRows_->nz(clqRowIdx);
@@ -490,9 +495,9 @@ void CglCliqueStrengthening::checkDominance(const size_t *extClqEl, size_t extCl
     ivCol[extClqEl[i]] = false;
   }
 
-  //clearing ivRow
-  for (size_t i = 0; i < cliqueRows_->rows(); i++) {
-    ivRow[i] = false;
+  //clearing ivRow — only entries that were touched
+  for (size_t i = 0; i < nDirty; i++) {
+    ivRow[dirtyRows_[i]] = false;
   }
 }
 
@@ -595,7 +600,7 @@ void CglCliqueStrengthening::addStrongerCliques(const CoinCliqueSet *newCliques)
     // adding rows
     const int lastOrigIdx = model_->getNumRows();
     model_->addRows(nCliques, nrStart, nrIdx, nrCoef, nrLB, nrUB);
-    
+
     // setting names
     for (int i = 0; i < (int)nCliques; i++) {
       model_->setRowName(lastOrigIdx + i, rowClqNames_[i]);
